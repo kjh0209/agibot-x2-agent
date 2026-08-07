@@ -27,6 +27,8 @@ from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu
 
 from aimdk_msgs.msg import JointState, JointStateArray, McLocomotionVelocity
 
+from x2_sim.mc_services import McMock
+
 DEFAULT_MODEL = ('/sdk/aimdk-1.0.0/extra/x2_rl_deploy/x2_rl_deploy_mujoco/'
                  'configuration/robot/lx2501_3_t2d5/model_info/scene.xml')
 
@@ -183,6 +185,12 @@ class X2SimNode(Node):
             McLocomotionVelocity, '/aima/mc/locomotion/velocity',
             self.on_cmd_vel, 10)
 
+        # MC 목 서비스 (실기 프로토콜 강제: 모드/소스 게이트)
+        self.mc = McMock(self)
+        # 프리셋 모션 애니메이션 상태: (이름, 시작 sim time) 또는 None
+        self.motion = None
+        self.jname_to_ai = {n: i for i, n in enumerate(self.joint_names)}
+
         self.prev_base_linvel = np.zeros(3)
         self.seq = 0
 
@@ -220,6 +228,9 @@ class X2SimNode(Node):
 
     # ---------- 콜백 ----------
     def on_cmd_vel(self, msg: McLocomotionVelocity):
+        # 실기 의미론 게이트: locomotion 모드 + 등록된 소스가 아니면 무시
+        if not self.mc.gate_velocity(msg.source):
+            return
         self.cmd_vel = np.array([
             msg.forward_velocity, msg.lateral_velocity, msg.angular_velocity])
         self.cmd_time = self.data.time
@@ -227,6 +238,39 @@ class X2SimNode(Node):
             f'이동 명령 수신: vx={msg.forward_velocity:.2f} '
             f'vy={msg.lateral_velocity:.2f} wz={msg.angular_velocity:.2f} '
             f'(source={msg.source!r})')
+
+    def clear_locomotion(self):
+        """비상(damping/zero-torque) 진입 시 이동 명령 즉시 소거."""
+        self.cmd_vel = np.zeros(3)
+
+    def play_motion(self, name: str):
+        """프리셋 모션 시작 (McMock에서 검증 후 호출됨)."""
+        self.motion = (name, self.data.time)
+
+    def motion_offsets(self):
+        """진행 중인 프리셋 모션의 관절 오프셋 계산 (q_ref에 가산)."""
+        if self.motion is None:
+            return None
+        name, t0 = self.motion
+        t = self.data.time - t0
+        dur = 2.5
+        if t >= dur:
+            self.motion = None
+            return None
+        # 부드러운 시작/끝 (0→1→0 envelope)
+        env = math.sin(math.pi * min(t / dur, 1.0))
+        off = {}
+        if name in ('POINT_HEAD',):
+            off['head_pitch_joint'] = 0.3 * env * math.sin(2 * math.pi * 1.5 * t)
+        elif name in ('SHAKE_HEAD',):
+            off['head_yaw_joint'] = 0.35 * env * math.sin(2 * math.pi * 1.5 * t)
+        else:
+            # 손 계열 기본 동작: 오른팔 들어 흔들기
+            off['right_shoulder_pitch_joint'] = -1.3 * env
+            off['right_shoulder_roll_joint'] = -0.3 * env
+            off['right_elbow_joint'] = (-0.6 + 0.4 * math.sin(
+                2 * math.pi * 2.0 * t)) * env
+        return off
 
     # ---------- 메인 루프 ----------
     def tick(self):
@@ -242,7 +286,15 @@ class X2SimNode(Node):
     def apply_pd(self):
         q = self.data.qpos[self.act_qpos_adr]
         v = self.data.qvel[self.act_qvel_adr]
-        tau = self.kp * (self.q_ref - q) - self.kd * v
+        q_target = self.q_ref
+        offs = self.motion_offsets()
+        if offs:
+            q_target = self.q_ref.copy()
+            for jname, delta in offs.items():
+                ai = self.jname_to_ai.get(jname)
+                if ai is not None:
+                    q_target[ai] += delta
+        tau = self.kp * (q_target - q) - self.kd * v
         self.data.ctrl[:] = np.clip(
             tau, self.model.actuator_ctrlrange[:, 0],
             self.model.actuator_ctrlrange[:, 1]) \

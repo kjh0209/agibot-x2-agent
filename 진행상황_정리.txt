@@ -307,16 +307,74 @@ Agibot X2 메신저 에이전트 시스템 — 진행 상황 종합 정리
           퍼블리셔 추가 예정.
 
 --------------------------------------------------------------------------------
-7. 다음 단계: Phase 2 — 카메라 브릿지 ("로봇이 보는 화면")
+7. Phase 2 — 카메라 브릿지 (완료, 2026-08-07)
 --------------------------------------------------------------------------------
-  계획 (로드맵 기준 2~3일):
-  1) x2_sim에 offscreen 렌더 카메라 추가 (OSMesa, GUI 불필요)
-     - MJCF에 head 카메라가 정의돼 있는지 확인, 없으면 URDF의 카메라
-       프레임 위치(rgbd_head_front)에 가상 카메라 부착
-     - 실기 토픽명 그대로: /aima/hal/sensor/rgbd_head_front/rgb_image
-       (+ /compressed, camera_info), 10~15Hz
-  2) 씬에 테스트 오브젝트(박스/컵 등) 배치 — "앞에 뭐 보여?" 검증용
-  3) web_video_server 또는 자체 MJPEG 스트리머로 브라우저 확인
-     (컨테이너 8080 포트 → Mac 브라우저 http://localhost:8080)
-  완료 기준: 브라우저에서 로봇 1인칭 시점 영상이 실시간으로 보인다.
+  - MJCF에 <camera> 없음 확인 → MjSpec API로 벤더 파일 무수정 로드 후
+    head_pitch_link에 카메라 주입 (수직 FOV 55° = 매뉴얼 RGB-D 스펙,
+    18° 하향, 위치 [0.06, 0, 0.12]). 조명 1개 보강(VLM 가독성).
+  - 테스트 오브젝트: 테이블(1.3m 전방), 빨간 박스, 파란 컵, 노란 공.
+  - 퍼블리시(실기 토픽명, QoS SENSOR_DATA):
+      /aima/hal/sensor/rgbd_head_front/rgb_image            (raw, 디버깅용)
+      /aima/hal/sensor/rgbd_head_front/rgb_image/compressed (JPEG, 주 경로)
+      /aima/hal/sensor/rgbd_head_front/rgb_camera_info
+  - 뷰어: ros2 run x2_sim mjpeg_server → http://localhost:8080
+    (/, /stream, /snapshot.jpg)
+  - 검증: 스냅샷에서 테이블·박스·컵 확인, 회전 명령 -0.5rad/s×2s →
+    yaw -62° 일치, 시야 변화 확인.
+  - 버그 수정 2건: ①카메라 앙각(하늘만 보임)→18° 하향, ②렌더가 물리
+    틱을 블로킹해 시뮬 시간 지연(회전 1/3만 반영)→MultiThreadedExecutor
+    +상태 락으로 렌더/물리 분리.
+  - 제약: CPU(OSMesa) 렌더 프레임당 ~0.7s → 스트림 1~2fps. 대화형
+    에이전트에는 충분. 기본 camera_rate=2Hz. Phase 3 look()은 단발 렌더.
+
+--------------------------------------------------------------------------------
+8. Phase 2.5 — MC 목 서비스: 실기 프로토콜 강제 (완료, 2026-08-07)
+--------------------------------------------------------------------------------
+  배경: 자체 시뮬이 모든 명령을 무조건 수용하면 에이전트가 "모드 확인
+  없이 velocity부터 쏘는" 코드로 완성되고, 실기(Phase 6→7)에서 조용히
+  무시되는 버그가 됨 — 이를 막기 위해 실기 의미론을 시뮬에 이식.
+
+  구현 (ros2_ws/src/x2_sim/x2_sim/mc_services.py, McMock 클래스):
+  - 서비스 5종, 실기와 동일 이름(/aimdk_5Fmsgs/srv/...):
+      SetMcAction / GetMcAction / SetMcPresetMotion /
+      SetMcInputSource / GetCurrentInputSource
+  - 입력 소스 레지스트리: 기본 'rc'(priority 100). ADD/MODIFY/DELETE/
+    ENABLE/DISABLE(McInputAction 1001~2002) 처리.
+  - 액션 상태 머신(McAction 코드): 시작 STAND_DEFAULT(200).
+    전이 규칙 — LOCOMOTION(300)은 STAND 계열에서만 진입,
+    비상 계열(PASSIVE/DAMPING/ZERO_TORQUE/SOFT_ESTOP)은 어디서든 진입
+    가능하며 진입 시 이동 명령 즉시 소거.
+  - velocity 게이트: LOCOMOTION 모드 + 등록/활성 소스가 아니면
+    무시+경고 로그 (실기 동일 거동).
+  - 프리셋 모션: 화이트리스트(WAVE_HAND=1002 등 23종), STAND 계열에서만
+    허용(매뉴얼: locomotion 중 상지 동작 불가). 실행 시 2.5초
+    애니메이션(손 흔들기/고개 끄덕임·젓기, q_ref 오프셋 방식).
+
+  검증(전 시나리오 통과):
+  [1] STAND에서 velocity → 무시+경고 ✓
+  [2] 미등록 소스 SetMcAction → INVALID(5) 거부 ✓
+  [3] SetMcInputSource ADD 'agent' → 등록 ✓
+  [4] 등록 소스로 LOCOMOTION 전환 → 성공 ✓
+  [5] GetMcAction → LOCOMOTION_DEFAULT ✓
+  [6] velocity → 수용, 이동 ✓
+  [7] LOCOMOTION 중 WAVE_HAND → FAILURE(2) 거부 ✓
+  [8] STAND 복귀 후 WAVE_HAND → 실행, 어깨 관절 -0.44rad 스윙 확인 ✓
+  ※주의: SetMcPresetMotion 요청에는 source 필드가 없음(스키마 확인됨)
+    — 소스 게이트는 velocity/SetMcAction에만 적용.
+
+  → 이로써 Phase 3 에이전트의 툴 실행기는 시뮬 단계부터
+    "소스 등록 → 모드 확인/전환 → 명령" 프로토콜을 강제로 따르게 됨.
+
+--------------------------------------------------------------------------------
+9. 다음 단계: Phase 3 — 로봇 에이전트 노드 (두뇌)
+--------------------------------------------------------------------------------
+  - 컨텍스트 수집기: 카메라 프레임 링버퍼(compressed 구독), 상태 캐시
+    (관절/IMU/McAction 모드), QoS SENSOR_DATA.
+  - Claude API 클라이언트: 최신 프레임(고해상도 단발 렌더 또는 최신
+    compressed) + 상태 JSON + 히스토리. 프롬프트 캐싱, 이벤트 기반 호출.
+    개발 루프는 Haiku, 데모는 Sonnet (비용 계획 준수).
+  - 툴: look/move/play_motion/speak/show_emoji/stop —
+    move·play_motion은 McMock 프로토콜(등록→모드→명령)을 통과해야 동작.
+  - 완료 기준: CLI에서 "지금 뭐 보여?" → 씬 오브젝트 정확 묘사,
+    "앞으로 조금 가봐" → 시뮬 로봇 이동.
 ================================================================================
