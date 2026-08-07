@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 
 from aimdk_msgs.msg import McAction, McInputAction, McLocomotionVelocity
+from std_msgs.msg import String
 from aimdk_msgs.srv import (
     GetMcAction,
     SetMcAction,
@@ -58,6 +59,18 @@ class ToolExecutor:
         self.pub_vel = node.create_publisher(
             McLocomotionVelocity, '/aima/mc/locomotion/velocity', 10)
         self._stop_requested = False
+        # 하드와이어 정지 수신 (UI 버튼 등 외부 독립 경로) — 기본 콜백
+        # 그룹이라 채팅 처리 중에도 즉시 실행됨
+        node.create_subscription(
+            String, '/agent/hard_stop', self._on_hard_stop, 10)
+
+    def _on_hard_stop(self, msg: String):
+        self._stop_requested = True
+        vel = McLocomotionVelocity()
+        vel.source = SOURCE
+        self.pub_vel.publish(vel)   # 속도 0
+        self.log.warning(f'하드 정지 수신 (from={msg.data!r}) — 이동 루프 중단')
+        self.audit('hard_stop', {'from': msg.data}, True, 'interrupted')
 
     # ---------- 공통 유틸 ----------
     def audit(self, tool, args, ok, result):
@@ -131,12 +144,17 @@ class ToolExecutor:
         self.audit('look', {}, True, f'{len(frame)} bytes jpeg')
         return {'image_b64': base64.standard_b64encode(frame).decode()}
 
-    def get_status(self):
+    def status_snapshot(self):
+        """감사 로그 없이 상태 요약 (매 턴 자동 주입용)."""
         st = self.node.status_summary()
         try:
             st['mode'] = ACTION_NAMES.get(self.current_action(), '?')
         except RuntimeError as e:
             st['mode'] = f'조회 실패: {e}'
+        return st
+
+    def get_status(self):
+        st = self.status_snapshot()
         self.audit('get_status', {}, True, st)
         return st
 

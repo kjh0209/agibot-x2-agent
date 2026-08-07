@@ -7,6 +7,7 @@
 - 히스토리: 오래된 턴의 이미지 블록은 텍스트 플레이스홀더로 치환해
   토큰 절약 (이미지 1장 ≈ 400토큰).
 """
+import json
 import os
 
 import anthropic
@@ -20,6 +21,9 @@ SYSTEM = """\
 대화하며, 너의 눈(머리 카메라)으로 세상을 보고 몸을 움직일 수 있다.
 
 # 도구 사용 규칙
+- 매 사용자 메시지 앞에 <robot_state>(모드/위치/직립 여부 등)가 자동
+  첨부된다. 간단한 상태 질문은 이걸로 즉답하고, get_status는 방금
+  행동 후 최신 값을 다시 확인할 때만 호출한다.
 - 시각 질문("뭐 보여?", "앞에 뭐 있어?")은 반드시 look으로 실제 프레임을
   본 뒤 답한다. 추측으로 답하지 않는다.
 - 이동 요청은 move를 사용한다. 속도·시간 상한은 코드가 강제하므로
@@ -196,7 +200,20 @@ class AgentBrain:
 
     # ---------- 메인 ----------
     def chat(self, user_text: str) -> str:
-        self.history.append({'role': 'user', 'content': user_text})
+        # C-①: 현재 상태를 유저 턴에 자동 주입 (시스템 프리픽스는 고정
+        # 유지 → 프롬프트 캐시 보호. 상태를 시스템에 넣으면 매 턴 캐시가
+        # 깨진다). 덕분에 단순 상태 질문은 get_status 왕복 없이 즉답.
+        try:
+            state = self.executor.status_snapshot()
+            state_txt = ('<robot_state>'
+                         + json.dumps(state, ensure_ascii=False)
+                         + '</robot_state>')
+        except Exception as e:
+            state_txt = f'<robot_state>조회 실패: {e}</robot_state>'
+        self.history.append({'role': 'user', 'content': [
+            {'type': 'text', 'text': state_txt},
+            {'type': 'text', 'text': user_text},
+        ]})
         final_text = ''
         for _ in range(8):  # 툴 루프 상한
             resp = self.client.messages.create(
@@ -207,6 +224,13 @@ class AgentBrain:
                 tools=TOOLS,
                 messages=self.history,
             )
+            # I: LLM usage를 감사 로그에 기록 (비용 대시보드 기초 데이터)
+            u = resp.usage
+            self.executor.audit('llm', {'model': MODEL}, True, json.dumps({
+                'in': u.input_tokens, 'out': u.output_tokens,
+                'cache_read': getattr(u, 'cache_read_input_tokens', 0),
+                'cache_write': getattr(u, 'cache_creation_input_tokens', 0),
+            }))
             content_dump = []
             for block in resp.content:
                 if block.type == 'text':

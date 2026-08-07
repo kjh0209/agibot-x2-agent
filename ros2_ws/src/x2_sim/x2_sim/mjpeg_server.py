@@ -15,7 +15,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
+
+from aimdk_msgs.msg import McLocomotionVelocity
 
 TOPIC = '/aima/hal/sensor/rgbd_head_front/rgb_image/compressed'
 PORT = 8080
@@ -27,18 +30,31 @@ INDEX_HTML = """<!doctype html>
  body{background:#111;color:#eee;font-family:sans-serif;text-align:center}
  img{max-width:95%;border:2px solid #444;border-radius:8px;margin-top:12px}
  code{background:#222;padding:2px 6px;border-radius:4px}
- button{background:#c0392b;color:#fff;border:0;border-radius:8px;
-        padding:10px 22px;font-size:15px;cursor:pointer;margin-top:14px}
- button:hover{background:#e74c3c}
+ button{border:0;border-radius:8px;padding:10px 22px;font-size:15px;
+        cursor:pointer;margin-top:14px;color:#fff}
+ .reset{background:#c0392b}.reset:hover{background:#e74c3c}
+ .stop{background:#f39c12;font-weight:bold;font-size:17px;
+       padding:12px 30px;margin-right:14px}
+ .stop:hover{background:#e67e22}
  #st{margin-left:12px;color:#8f8}
 </style>
 <h2>Agibot X2 — 로봇이 보는 화면 (시뮬)</h2>
 <img src="/stream" alt="robot view">
 <div>
- <button onclick="doReset()">🔄 시뮬 초기화 (처음 위치로)</button>
+ <button class="stop" onclick="doStop()">🛑 즉시 정지</button>
+ <button class="reset" onclick="doReset()">🔄 시뮬 초기화 (처음 위치로)</button>
  <span id="st"></span>
 </div>
+<p style="color:#888;font-size:12px">즉시 정지는 LLM·에이전트를 거치지 않는
+독립 경로입니다 (채팅의 "멈춰"는 별도의 두 번째 경로)</p>
 <script>
+function doStop(){
+  const st=document.getElementById('st');
+  fetch('/stop',{method:'POST'})
+    .then(r=>r.text()).then(t=>{st.textContent=t;
+      setTimeout(()=>st.textContent='',3000);})
+    .catch(e=>{st.textContent='실패: '+e;});
+}
 function doReset(){
   const st=document.getElementById('st');
   st.textContent='초기화 중...';
@@ -79,7 +95,22 @@ class ViewerNode(Node):
             CompressedImage, TOPIC,
             lambda m: store.put(bytes(m.data)), qos_profile_sensor_data)
         self.reset_cli = self.create_client(Trigger, '/x2_sim/reset')
+        # 하드와이어 정지 경로 (LLM·에이전트 큐와 완전 독립):
+        #  ① rc 소스로 velocity 0 직접 발행 (시뮬/실기 즉시 감속)
+        #  ② /agent/hard_stop 으로 에이전트 move 재발행 루프 인터럽트
+        self.pub_vel = self.create_publisher(
+            McLocomotionVelocity, '/aima/mc/locomotion/velocity', 10)
+        self.pub_hard_stop = self.create_publisher(
+            String, '/agent/hard_stop', 10)
         self.get_logger().info(f'구독: {TOPIC} → http://0.0.0.0:{PORT}')
+
+    def hard_stop(self):
+        vel = McLocomotionVelocity()
+        vel.source = 'rc'          # 기본 등록 소스 — 게이트 통과 보장
+        self.pub_vel.publish(vel)  # 속도 0
+        self.pub_hard_stop.publish(String(data='ui_button'))
+        self.get_logger().warning('하드와이어 정지 발행 (UI 버튼)')
+        return True, '정지 발행 완료 (LLM 독립 경로)'
 
     def call_reset(self, timeout=5.0):
         if not self.reset_cli.wait_for_service(timeout_sec=2.0):
@@ -102,7 +133,15 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        if self.path == '/reset':
+        if self.path == '/stop':
+            ok, msg = viewer_node.hard_stop()
+            body = msg.encode()
+            self.send_response(200 if ok else 500)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == '/reset':
             ok, msg = viewer_node.call_reset()
             body = msg.encode()
             self.send_response(200 if ok else 500)
