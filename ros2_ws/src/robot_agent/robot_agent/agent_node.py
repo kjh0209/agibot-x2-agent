@@ -39,13 +39,14 @@ class AgentNode(Node):
         super().__init__('robot_agent')
         # ---------- 컨텍스트 수집기 ----------
         self.frames = collections.deque(maxlen=3)   # 최근 JPEG 프레임
+        self.frame_count = 0
+        self.frame_cond = threading.Condition()
         self.joint_pos = {}                          # group → n joints
         self.imu_quat = (1.0, 0.0, 0.0, 0.0)
         self.create_subscription(
             CompressedImage,
             '/aima/hal/sensor/rgbd_head_front/rgb_image/compressed',
-            lambda m: self.frames.append(bytes(m.data)),
-            qos_profile_sensor_data)
+            self.on_frame, qos_profile_sensor_data)
         for g in ('arm', 'leg', 'waist', 'head'):
             self.create_subscription(
                 JointStateArray, f'/aima/hal/joint/{g}/state',
@@ -103,9 +104,24 @@ class AgentNode(Node):
         """툴의 비동기 완료 통지 → UI 이벤트로 전달."""
         self.pub_event.publish(String(data=f'[알림] {text}'))
 
+    def on_frame(self, msg: CompressedImage):
+        with self.frame_cond:
+            self.frames.append(bytes(msg.data))
+            self.frame_count += 1
+            self.frame_cond.notify_all()
+
     # ---------- ToolExecutor가 쓰는 인터페이스 ----------
-    def latest_frame(self):
-        return self.frames[-1] if self.frames else None
+    def latest_frame(self, fresh: bool = True, timeout: float = 1.5):
+        """최신 프레임 반환. fresh=True면 '호출 이후 도착한' 프레임을
+        기다린다 (2Hz 스트림 기준 최대 ~0.5s) — 이동/회전 직후의
+        낡은 프레임으로 묘사하는 것을 방지 (묘사 품질 이슈 대응)."""
+        if not fresh:
+            return self.frames[-1] if self.frames else None
+        with self.frame_cond:
+            n = self.frame_count
+            self.frame_cond.wait_for(
+                lambda: self.frame_count > n, timeout=timeout)
+            return self.frames[-1] if self.frames else None
 
     def status_summary(self):
         w, x, y, z = self.imu_quat

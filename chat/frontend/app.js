@@ -125,6 +125,34 @@ document.getElementById('btn-reset').addEventListener('click', () => {
     });
 });
 
+/* ---------- 월드 선택 ---------- */
+const worldSel = document.getElementById('world-sel');
+function loadWorlds() {
+  fetch('/worlds').then(r => r.json()).then(d => {
+    worldSel.innerHTML = '';
+    for (const [name, desc] of Object.entries(d.worlds)) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = `🌍 ${desc}`;
+      if (name === d.current) opt.selected = true;
+      worldSel.appendChild(opt);
+    }
+  });
+}
+loadWorlds();
+worldSel.addEventListener('change', () => {
+  ctlMsg.textContent = '월드 전환 중…';
+  fetch('/world', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: worldSel.value }),
+  }).then(r => r.text()).then(t => {
+    ctlMsg.textContent = t;
+    addMsg('sys', `🌍 월드 전환: ${worldSel.value}`);
+    setTimeout(() => (ctlMsg.textContent = ''), 4000);
+  });
+});
+
 /* ---------- 이력 로드 ---------- */
 fetch('/history').then(r => r.json()).then(rows => {
   rows.forEach(r => addMsg(r.kind === 'user' ? 'user'

@@ -25,6 +25,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from aimdk_msgs.msg import (
@@ -35,6 +36,7 @@ from aimdk_msgs.msg import (
 )
 
 from x2_sim.mc_services import McMock
+from x2_sim.worlds import DEFAULT_WORLD, WORLDS
 
 DEFAULT_MODEL = ('/sdk/aimdk-1.0.0/extra/x2_rl_deploy/x2_rl_deploy_mujoco/'
                  'configuration/robot/lx2501_3_t2d5/model_info/scene.xml')
@@ -59,22 +61,28 @@ def group_of(joint_name: str):
 CAMERA_NAME = 'rgbd_head_front'
 
 
-def load_model_with_camera_and_props(model_path: str):
-    """공식 MJCF를 로드하되, 벤더 파일 수정 없이 스펙 단계에서
-    head 카메라와 테스트 오브젝트를 추가한다.
+GEOM_TYPES = {
+    'box': mujoco.mjtGeom.mjGEOM_BOX,
+    'cylinder': mujoco.mjtGeom.mjGEOM_CYLINDER,
+    'sphere': mujoco.mjtGeom.mjGEOM_SPHERE,
+}
 
-    - 카메라: head_pitch_link(머리) 전면, 로봇 +X 방향 응시, 수직 FOV 55°
-      (매뉴얼 2.5의 RGB-D 수직 FOV와 동일)
-    - 오브젝트: 테이블/빨간 박스/파란 컵/노란 공 — "앞에 뭐 보여?" 검증용
+
+def load_model_with_camera_and_props(model_path: str,
+                                     world_name: str = DEFAULT_WORLD):
+    """공식 MJCF 로드 + 벤더 파일 무수정으로 카메라·월드 소품 주입.
+
+    - 카메라: head_pitch_link 전면, 수직 FOV 55°(매뉴얼 RGB-D 스펙), 18° 하향
+    - 소품/조명: worlds.py의 월드 정의에 따름
+    반환: (compiled model, prop 이름 목록)
     """
+    world = WORLDS[world_name]
     spec = mujoco.MjSpec.from_file(model_path)
 
     head = spec.body('head_pitch_link')
     cam = head.add_camera()
     cam.name = CAMERA_NAME
     cam.pos = [0.06, 0.0, 0.12]
-    # 카메라 프레임: -Z가 시선 방향. 로봇 +X를 보되 pitch_down만큼
-    # 아래로 기울인다 (테이블 위 물체가 화면 중앙에 오도록).
     p = math.radians(18.0)
     s, c = math.sin(p), math.cos(p)
     rot = np.array([[0.0, s, -c],
@@ -85,34 +93,25 @@ def load_model_with_camera_and_props(model_path: str):
     cam.quat = quat
     cam.fovy = 55.0
 
-    # 씬 조명 보강 (VLM이 볼 이미지이므로 밝게)
-    light = spec.worldbody.add_light()
-    light.pos = [1.0, 0.0, 2.5]
-    light.dir = [0.1, 0.0, -1.0]
-    light.diffuse = [0.9, 0.9, 0.9]
-    light.castshadow = False
-
     wb = spec.worldbody
-    props = [
-        # (name, type, size, pos, rgba)
-        ('table', mujoco.mjtGeom.mjGEOM_BOX,
-         [0.30, 0.40, 0.36], [1.30, 0.0, 0.36], [0.55, 0.35, 0.20, 1.0]),
-        ('red_box', mujoco.mjtGeom.mjGEOM_BOX,
-         [0.05, 0.05, 0.05], [1.20, 0.18, 0.77], [0.85, 0.10, 0.10, 1.0]),
-        ('blue_cup', mujoco.mjtGeom.mjGEOM_CYLINDER,
-         [0.035, 0.06, 0.0], [1.30, -0.12, 0.78], [0.10, 0.25, 0.85, 1.0]),
-        ('yellow_ball', mujoco.mjtGeom.mjGEOM_SPHERE,
-         [0.06, 0.0, 0.0], [0.85, -0.55, 0.06], [0.95, 0.85, 0.10, 1.0]),
-    ]
-    for name, gtype, size, pos, rgba in props:
+    for pos, direction, diffuse in world['lights']:
+        light = wb.add_light()
+        light.pos = pos
+        light.dir = direction
+        light.diffuse = diffuse
+        light.castshadow = False
+
+    prop_names = []
+    for name, gtype, size, pos, rgba in world['props']:
         g = wb.add_geom()
         g.name = name
-        g.type = gtype
+        g.type = GEOM_TYPES[gtype]
         g.size = size
         g.pos = pos
         g.rgba = rgba
+        prop_names.append(name)
 
-    return spec.compile()
+    return spec.compile(), prop_names
 
 
 class X2SimNode(Node):
@@ -133,60 +132,20 @@ class X2SimNode(Node):
         self.declare_parameter('camera_height', 480)
         self.declare_parameter('jpeg_quality', 80)
 
-        model_path = self.get_parameter('model_path').value
-        self.model = load_model_with_camera_and_props(model_path)
-        self.data = mujoco.MjData(self.model)
-        self.get_logger().info(
-            f'모델 로드: {model_path} (nq={self.model.nq}, nu={self.model.nu}, '
-            f'timestep={self.model.opt.timestep})')
-
-        # 액추에이터가 무는 관절 인덱스 정리
-        self.act_joint_ids = [
-            self.model.actuator_trnid[i][0] for i in range(self.model.nu)]
-        self.act_qpos_adr = [
-            self.model.jnt_qposadr[j] for j in self.act_joint_ids]
-        self.act_qvel_adr = [
-            self.model.jnt_dofadr[j] for j in self.act_joint_ids]
-        self.joint_names = [
-            mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j)
-            for j in self.act_joint_ids]
-
-        # 그룹별 (actuator_index) 목록
-        self.groups = {g: [] for g in GROUP_KEYWORDS}
-        for ai, name in enumerate(self.joint_names):
-            g = group_of(name or '')
-            if g:
-                self.groups[g].append(ai)
-        for g, idxs in self.groups.items():
-            self.get_logger().info(f'그룹 {g}: {len(idxs)}개 관절')
-
-        # 초기 자세 = PD 홀드 목표 (모델 기본 qpos)
-        mujoco.mj_forward(self.model, self.data)
-        self.q_ref = np.array(
-            [self.data.qpos[a] for a in self.act_qpos_adr])
+        self.declare_parameter('world', DEFAULT_WORLD)
         self.kp = float(self.get_parameter('kp').value)
         self.kd = float(self.get_parameter('kd').value)
-
-        # 이동 명령 상태
-        self.cmd_vel = np.zeros(3)   # vx, vy, wz (body frame)
-        self.cmd_time = 0.0
-
-        # 베이스 고정 목표 (x, y, z, yaw) — 초기 pose에서 시작
         self.hold_base = bool(self.get_parameter('hold_base').value)
-        self.base_xyz = np.array(self.data.qpos[0:3])
-        qw, qx, qy, qz = self.data.qpos[3:7]
-        self.base_yaw = math.atan2(2 * (qw * qz + qx * qy),
-                                   1 - 2 * (qy * qy + qz * qz))
+        w = int(self.get_parameter('camera_width').value)
+        h = int(self.get_parameter('camera_height').value)
+        self.cam_size = (w, h)
+        self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
+        self.renderer = None
+        self.seq = 0
 
-        # 충돌 차단: 소품 geom id 수집 (키네마틱 베이스가 뚫고 지나가는
-        # 것을 막기 위해 로봇-소품 접촉 발생 시 해당 스텝 이동을 롤백)
-        self.prop_gids = set()
-        for name in ('table', 'red_box', 'blue_cup', 'yellow_ball'):
-            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
-            if gid >= 0:
-                self.prop_gids.add(gid)
-        self._contact_prev = False
-        self._blocked_logged = False
+        # 월드 로드 (모델/매핑/베이스/소품/렌더러 전부 이 안에서 구성 —
+        # 런타임 월드 전환 시에도 같은 메서드 재사용)
+        self._build_world(str(self.get_parameter('world').value))
 
         # 퍼블리셔 (실기 토픽명)
         self.pub_joint = {
@@ -219,21 +178,19 @@ class X2SimNode(Node):
         self.mc = McMock(self)
         # 시뮬 전용 리셋 서비스 (웹 버튼/CLI에서 호출)
         self.create_service(Trigger, '/x2_sim/reset', self.on_reset)
-        # 프리셋 모션 애니메이션 상태: (이름, 시작 sim time) 또는 None
-        self.motion = None
-        self.jname_to_ai = {n: i for i, n in enumerate(self.joint_names)}
-
-        self.prev_base_linvel = np.zeros(3)
-        self.seq = 0
+        # 월드 전환: /x2_sim/set_world 구독, 현재 월드는 latched 발행
+        from rclpy.qos import (DurabilityPolicy, QoSProfile)
+        latched = QoSProfile(depth=1)
+        latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.pub_world = self.create_publisher(
+            String, '/x2_sim/world', latched)
+        self.create_subscription(
+            String, '/x2_sim/set_world', self.on_set_world, 10)
+        self.pub_world.publish(String(data=self.world_name))
 
         # ---------- 카메라 (Phase 2: 로봇이 보는 화면) ----------
         # 실기 토픽명 그대로. compressed가 주 소비 경로(실기 WiFi 대역폭 대비),
         # raw는 디버깅/후처리용.
-        w = int(self.get_parameter('camera_width').value)
-        h = int(self.get_parameter('camera_height').value)
-        self.cam_size = (w, h)
-        self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
-        self.renderer = mujoco.Renderer(self.model, height=h, width=w)
         base = f'/aima/hal/sensor/{CAMERA_NAME}'
         self.pub_img_comp = self.create_publisher(
             CompressedImage, f'{base}/rgb_image/compressed',
@@ -242,10 +199,13 @@ class X2SimNode(Node):
             Image, f'{base}/rgb_image', qos_profile_sensor_data)
         self.pub_cam_info = self.create_publisher(
             CameraInfo, f'{base}/rgb_camera_info', qos_profile_sensor_data)
-        self.cam_info = self.make_camera_info(w, h, fovy_deg=55.0)
+        self.cam_info = self.make_camera_info(
+            self.cam_size[0], self.cam_size[1], fovy_deg=55.0)
         cam_rate = float(self.get_parameter('camera_rate').value)
         # 렌더(수십 ms)가 물리 틱을 막지 않도록 별도 콜백 그룹 + 상태 락
+        # render_lock: 월드 전환 시 렌더러 교체와 렌더링의 경합 방지
         self.state_lock = threading.Lock()
+        self.render_lock = threading.Lock()
         self.cam_group = MutuallyExclusiveCallbackGroup()
         self.create_timer(1.0 / cam_rate, self.tick_camera,
                           callback_group=self.cam_group)
@@ -257,6 +217,82 @@ class X2SimNode(Node):
         self.get_logger().info(
             f'시뮬 시작: {rate}Hz 퍼블리시, 스텝당 {self.substeps} 서브스텝, '
             f'카메라 {w}x{h}@{cam_rate}Hz → {base}/rgb_image[/compressed]')
+
+    # ---------- 월드 구성/전환 ----------
+    def _build_world(self, world_name: str):
+        """월드(씬) 로드 — 초기화와 런타임 전환 양쪽에서 사용.
+
+        모델/데이터/액추에이터 매핑/PD 목표/베이스 홀드/소품 충돌 목록/
+        렌더러/배터리를 전부 새로 구성한다. 호출측에서 락을 잡는다
+        (초기화 시엔 스레드가 없어 락 불필요).
+        """
+        model_path = self.get_parameter('model_path').value
+        self.model, prop_names = load_model_with_camera_and_props(
+            model_path, world_name)
+        self.data = mujoco.MjData(self.model)
+        self.world_name = world_name
+
+        self.act_joint_ids = [
+            self.model.actuator_trnid[i][0] for i in range(self.model.nu)]
+        self.act_qpos_adr = [
+            self.model.jnt_qposadr[j] for j in self.act_joint_ids]
+        self.act_qvel_adr = [
+            self.model.jnt_dofadr[j] for j in self.act_joint_ids]
+        self.joint_names = [
+            mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j)
+            for j in self.act_joint_ids]
+        self.groups = {g: [] for g in GROUP_KEYWORDS}
+        for ai, name in enumerate(self.joint_names):
+            g = group_of(name or '')
+            if g:
+                self.groups[g].append(ai)
+        self.jname_to_ai = {n: i for i, n in enumerate(self.joint_names)}
+
+        mujoco.mj_forward(self.model, self.data)
+        self.q_ref = np.array(
+            [self.data.qpos[a] for a in self.act_qpos_adr])
+        self.cmd_vel = np.zeros(3)
+        self.cmd_time = 0.0
+        self.motion = None
+        self.base_xyz = np.array(self.data.qpos[0:3])
+        qw, qx, qy, qz = self.data.qpos[3:7]
+        self.base_yaw = math.atan2(2 * (qw * qz + qx * qy),
+                                   1 - 2 * (qy * qy + qz * qz))
+        self.prev_base_linvel = np.zeros(3)
+        self.batt_start_time = self.data.time
+
+        self.prop_gids = set()
+        for name in prop_names:
+            gid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            if gid >= 0:
+                self.prop_gids.add(gid)
+        self._contact_prev = False
+        self._blocked_logged = False
+
+        if self.renderer is not None:
+            try:
+                self.renderer.close()
+            except Exception:
+                pass
+        self.renderer = mujoco.Renderer(
+            self.model, height=self.cam_size[1], width=self.cam_size[0])
+        self.get_logger().info(
+            f'월드 로드: {world_name} — 소품 {len(prop_names)}개, '
+            f'nq={self.model.nq}, nu={self.model.nu}')
+
+    def on_set_world(self, msg: String):
+        name = msg.data.strip()
+        if name not in WORLDS:
+            self.get_logger().warning(
+                f'미등록 월드 {name!r} — 사용 가능: {list(WORLDS)}')
+            return
+        with self.render_lock:
+            with self.state_lock:
+                self._build_world(name)
+        self.mc.reset()
+        self.pub_world.publish(String(data=name))
+        self.get_logger().info(f'월드 전환 완료: {name}')
 
     # ---------- 콜백 ----------
     def on_reset(self, req, res):
@@ -438,9 +474,10 @@ class X2SimNode(Node):
         return info
 
     def tick_camera(self):
-        with self.state_lock:
-            self.renderer.update_scene(self.data, camera=CAMERA_NAME)
-        rgb = self.renderer.render()          # (H, W, 3) uint8
+        with self.render_lock:
+            with self.state_lock:
+                self.renderer.update_scene(self.data, camera=CAMERA_NAME)
+            rgb = self.renderer.render()      # (H, W, 3) uint8
         stamp = self.get_clock().now().to_msg()
 
         buf = io.BytesIO()

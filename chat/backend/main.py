@@ -31,6 +31,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from aimdk_msgs.msg import McLocomotionVelocity, PmuState
+from x2_sim.worlds import WORLDS
 
 FRONT_DIR = Path(__file__).resolve().parent.parent / 'frontend'
 DB_PATH = Path('/ws/log/chat_history.db')
@@ -70,6 +71,15 @@ class Bridge(Node):
         self.pub_hard_stop = self.create_publisher(
             String, '/agent/hard_stop', 10)
         self.reset_cli = self.create_client(Trigger, '/x2_sim/reset')
+        # 월드 전환 (latched 구독으로 현재 월드 추적)
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        latched = QoSProfile(depth=1)
+        latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.pub_set_world = self.create_publisher(
+            String, '/x2_sim/set_world', 10)
+        self.create_subscription(
+            String, '/x2_sim/world',
+            lambda m: self.state.__setitem__('world', m.data), latched)
 
         self.create_subscription(
             CompressedImage,
@@ -209,6 +219,24 @@ async def status():
 async def stop():
     bridge.hard_stop()
     return Response('정지 발행 완료 (LLM 독립 경로)', media_type='text/plain')
+
+
+@app.get('/worlds')
+async def worlds():
+    return {
+        'current': bridge.state.get('world'),
+        'worlds': {name: w['desc'] for name, w in WORLDS.items()},
+    }
+
+
+@app.post('/world')
+async def set_world(payload: dict):
+    name = str(payload.get('name', ''))
+    if name not in WORLDS:
+        return Response(f'미등록 월드: {name}', status_code=400,
+                        media_type='text/plain')
+    bridge.pub_set_world.publish(String(data=name))
+    return Response(f'월드 전환 요청: {name}', media_type='text/plain')
 
 
 @app.post('/reset')

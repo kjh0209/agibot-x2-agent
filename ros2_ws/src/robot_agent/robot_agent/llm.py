@@ -141,9 +141,12 @@ class AgentBrain:
         self.history = []                 # anthropic messages
 
     # ---------- 히스토리 관리 ----------
-    def _strip_old_images(self):
-        """마지막 look 이외의 이미지 블록을 플레이스홀더로 치환."""
-        seen_recent = False
+    def _strip_old_images(self, keep_recent: bool = True):
+        """이미지 블록을 플레이스홀더로 치환해 토큰 절약 + 낡은 프레임
+        재사용 방지. keep_recent=False면 전부 치환 — 새 사용자 턴 시작
+        시 사용해, 시각 질문마다 반드시 새 look을 강제한다 (묘사 품질
+        이슈: 히스토리의 옛 프레임으로 답하는 것을 차단)."""
+        seen_recent = not keep_recent
         for msg in reversed(self.history):
             if not isinstance(msg.get('content'), list):
                 continue
@@ -153,7 +156,9 @@ class AgentBrain:
                     if isinstance(content, list) and any(
                             c.get('type') == 'image' for c in content):
                         if seen_recent:
-                            block['content'] = '[이전 카메라 프레임 — 생략됨]'
+                            block['content'] = ('[이전 카메라 프레임 — '
+                                                '생략됨. 현재가 궁금하면 '
+                                                'look을 다시 호출]')
                         else:
                             seen_recent = True
 
@@ -209,6 +214,9 @@ class AgentBrain:
         # C-①: 현재 상태를 유저 턴에 자동 주입 (시스템 프리픽스는 고정
         # 유지 → 프롬프트 캐시 보호. 상태를 시스템에 넣으면 매 턴 캐시가
         # 깨진다). 덕분에 단순 상태 질문은 get_status 왕복 없이 즉답.
+        # 새 턴 시작: 히스토리의 모든 프레임 무효화 → 시각 질문은
+        # 반드시 신선한 look을 거치게 됨
+        self._strip_old_images(keep_recent=False)
         try:
             state = self.executor.status_snapshot()
             state_txt = ('<robot_state>'
