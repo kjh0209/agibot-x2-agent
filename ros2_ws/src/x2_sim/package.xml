@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>x2_sim</name>
+  <version>0.1.0</version>
+  <description>
+    Agibot X2 자체 MuJoCo 시뮬 노드 (arm64 네이티브).
+    공식 MJCF(lx2501_3_t2d5)를 물리 시뮬하고 실기와 동일한
+    /aima/... 토픽·메시지 타입으로 퍼블리시한다.
+  </description>
+  <maintainer email="cupid26code@gmail.com">jensen.kvg</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>aimdk_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

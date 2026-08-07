@@ -1,10 +1,13 @@
 services:
   dev:
     build: .
-    # 공식 MuJoCo 시뮬 바이너리(aima-sim-app)가 x86-64 전용이라
-    # Apple Silicon에서도 amd64로 빌드/실행한다 (Colima Rosetta 필요)
-    platform: linux/amd64
-    image: agibot-x2-dev:humble
+    # arm64 네이티브로 구동 (Mac에서 최고 성능).
+    # 공식 시뮬 바이너리(aima-sim-app)는 클로즈드소스 모듈에 AVX가 포함되어
+    # Rosetta(amd64 에뮬)에서 실행 불가 확인(2026-08-07) → 자체 arm64
+    # Python MuJoCo 시뮬 노드(ros2_ws/src/x2_sim)로 대체.
+    # 공식 시뮬은 추후 x86 네이티브 Ubuntu PC에서 그대로 사용 가능.
+    platform: linux/arm64
+    image: agibot-x2-dev:humble-arm64
     container_name: agibot-dev
     # ros2_ws(워크스페이스)와 sdk를 컨테이너에 마운트
     volumes:
