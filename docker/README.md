@@ -12,8 +12,9 @@ Apple Silicon Mac에서는 ROS 2를 네이티브로 못 돌리므로 Docker 컨�
 # 2) Colima(무료 컨테이너 런타임) + Docker CLI + compose
 brew install colima docker docker-compose
 
-# 3) 컨테이너 VM 시작 (CPU 4 / 메모리 8GB 권장)
-colima start --cpu 4 --memory 8
+# 3) 컨테이너 VM 시작 — Rosetta 가속 필수!
+#    (공식 시뮬 바이너리가 x86-64 전용이라 amd64 컨테이너를 돌린다)
+colima start --cpu 4 --memory 8 --vm-type vz --vz-rosetta
 ```
 
 ## 컨테이너 빌드 및 진입

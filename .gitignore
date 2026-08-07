@@ -5,8 +5,9 @@
 # 대용량 원본 문서 (PDF 78MB — Git에 넣지 않음)
 *.pdf
 
-# SDK/시뮬 산출물
+# SDK/시뮬 산출물 (벤더 코드 — zip 원본과 노트만 관리)
 sdk/downloads/
+sdk/aimdk-*/
 build/
 install/
 log/
