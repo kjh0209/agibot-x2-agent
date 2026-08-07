@@ -24,3 +24,7 @@ dist/
 # OS/에디터
 .DS_Store
 .vscode/
+
+# 크래시 코어덤프
+core
+core.*
