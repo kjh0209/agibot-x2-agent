@@ -60,6 +60,22 @@
 
 **완료 기준**: 브라우저에서 로봇 1인칭 시점 영상이 실시간으로 보인다.
 
+> **실행 기록 (2026-08-07)**: x2_sim에 통합 구현 완료. MjSpec으로 벤더 MJCF
+> 무수정 로드 후 head_pitch_link에 카메라(수직 FOV 55°, 18° 하향) 부착,
+> 테스트 오브젝트(테이블·빨간 박스·파란 컵·노란 공) 배치. 실기 토픽명
+> `/aima/hal/sensor/rgbd_head_front/rgb_image[/compressed]` + rgb_camera_info
+> 퍼블리시(compressed가 주 소비 경로 — 실기 WiFi 대역폭 대비). MJPEG 뷰어
+> `http://localhost:8080` (ros2 run x2_sim mjpeg_server). 이동 명령 → 시야
+> 변화 e2e 검증 완료. CPU(OSMesa) 렌더라 스트림 ~1-2fps — 에이전트 look()은
+> 단발 렌더로 처리 예정. 렌더/물리 스레드 분리(MultiThreadedExecutor)로
+> 시뮬 시간 왜곡 해결.
+>
+> **다음(Phase 2.5, 추가됨)**: MC 목 서비스 — SetMcAction/GetMcAction/
+> SetMcPresetMotion/SetMcInputSource/GetCurrentInputSource를 실기 의미론
+> 그대로(모드 아니면 velocity 무시, 미등록 소스 거부) 구현해 에이전트가
+> "모드 확인 → 소스 등록 → 명령" 프로토콜을 시뮬에서 강제 학습하게 한다.
+> 에이전트 구독자는 QoS SENSOR_DATA(best-effort)로 작성(실기 1000Hz 대비).
+
 ---
 
 ## Phase 3. 로봇 에이전트 노드 — 두뇌 (1주)

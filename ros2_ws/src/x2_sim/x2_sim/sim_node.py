@@ -11,14 +11,19 @@
 구독:
   /aima/mc/locomotion/velocity                 aimdk_msgs/McLocomotionVelocity
 """
+import io
 import math
+import threading
 
 import mujoco
 import numpy as np
 import rclpy
+from PIL import Image as PILImage
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu
 
 from aimdk_msgs.msg import JointState, JointStateArray, McLocomotionVelocity
 
@@ -42,6 +47,65 @@ def group_of(joint_name: str):
     return None
 
 
+CAMERA_NAME = 'rgbd_head_front'
+
+
+def load_model_with_camera_and_props(model_path: str):
+    """공식 MJCF를 로드하되, 벤더 파일 수정 없이 스펙 단계에서
+    head 카메라와 테스트 오브젝트를 추가한다.
+
+    - 카메라: head_pitch_link(머리) 전면, 로봇 +X 방향 응시, 수직 FOV 55°
+      (매뉴얼 2.5의 RGB-D 수직 FOV와 동일)
+    - 오브젝트: 테이블/빨간 박스/파란 컵/노란 공 — "앞에 뭐 보여?" 검증용
+    """
+    spec = mujoco.MjSpec.from_file(model_path)
+
+    head = spec.body('head_pitch_link')
+    cam = head.add_camera()
+    cam.name = CAMERA_NAME
+    cam.pos = [0.06, 0.0, 0.12]
+    # 카메라 프레임: -Z가 시선 방향. 로봇 +X를 보되 pitch_down만큼
+    # 아래로 기울인다 (테이블 위 물체가 화면 중앙에 오도록).
+    p = math.radians(18.0)
+    s, c = math.sin(p), math.cos(p)
+    rot = np.array([[0.0, s, -c],
+                    [-1.0, 0.0, 0.0],
+                    [0.0, c, s]])
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, rot.flatten())
+    cam.quat = quat
+    cam.fovy = 55.0
+
+    # 씬 조명 보강 (VLM이 볼 이미지이므로 밝게)
+    light = spec.worldbody.add_light()
+    light.pos = [1.0, 0.0, 2.5]
+    light.dir = [0.1, 0.0, -1.0]
+    light.diffuse = [0.9, 0.9, 0.9]
+    light.castshadow = False
+
+    wb = spec.worldbody
+    props = [
+        # (name, type, size, pos, rgba)
+        ('table', mujoco.mjtGeom.mjGEOM_BOX,
+         [0.30, 0.40, 0.36], [1.30, 0.0, 0.36], [0.55, 0.35, 0.20, 1.0]),
+        ('red_box', mujoco.mjtGeom.mjGEOM_BOX,
+         [0.05, 0.05, 0.05], [1.20, 0.18, 0.77], [0.85, 0.10, 0.10, 1.0]),
+        ('blue_cup', mujoco.mjtGeom.mjGEOM_CYLINDER,
+         [0.035, 0.06, 0.0], [1.30, -0.12, 0.78], [0.10, 0.25, 0.85, 1.0]),
+        ('yellow_ball', mujoco.mjtGeom.mjGEOM_SPHERE,
+         [0.06, 0.0, 0.0], [0.85, -0.55, 0.06], [0.95, 0.85, 0.10, 1.0]),
+    ]
+    for name, gtype, size, pos, rgba in props:
+        g = wb.add_geom()
+        g.name = name
+        g.type = gtype
+        g.size = size
+        g.pos = pos
+        g.rgba = rgba
+
+    return spec.compile()
+
+
 class X2SimNode(Node):
     def __init__(self):
         super().__init__('x2_sim')
@@ -53,8 +117,15 @@ class X2SimNode(Node):
         # 이동 명령은 고정 베이스의 목표 위치/방향을 옮기는 방식으로 처리.
         self.declare_parameter('hold_base', True)
 
+        # CPU(OSMesa) 렌더가 프레임당 ~0.7s라 실효 1~2fps.
+        # 대화형 에이전트에는 충분. (Phase 3: look()은 필요 시 단발 렌더)
+        self.declare_parameter('camera_rate', 2.0)
+        self.declare_parameter('camera_width', 640)
+        self.declare_parameter('camera_height', 480)
+        self.declare_parameter('jpeg_quality', 80)
+
         model_path = self.get_parameter('model_path').value
-        self.model = mujoco.MjModel.from_xml_path(model_path)
+        self.model = load_model_with_camera_and_props(model_path)
         self.data = mujoco.MjData(self.model)
         self.get_logger().info(
             f'모델 로드: {model_path} (nq={self.model.nq}, nu={self.model.nu}, '
@@ -115,12 +186,37 @@ class X2SimNode(Node):
         self.prev_base_linvel = np.zeros(3)
         self.seq = 0
 
+        # ---------- 카메라 (Phase 2: 로봇이 보는 화면) ----------
+        # 실기 토픽명 그대로. compressed가 주 소비 경로(실기 WiFi 대역폭 대비),
+        # raw는 디버깅/후처리용.
+        w = int(self.get_parameter('camera_width').value)
+        h = int(self.get_parameter('camera_height').value)
+        self.cam_size = (w, h)
+        self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
+        self.renderer = mujoco.Renderer(self.model, height=h, width=w)
+        base = f'/aima/hal/sensor/{CAMERA_NAME}'
+        self.pub_img_comp = self.create_publisher(
+            CompressedImage, f'{base}/rgb_image/compressed',
+            qos_profile_sensor_data)
+        self.pub_img_raw = self.create_publisher(
+            Image, f'{base}/rgb_image', qos_profile_sensor_data)
+        self.pub_cam_info = self.create_publisher(
+            CameraInfo, f'{base}/rgb_camera_info', qos_profile_sensor_data)
+        self.cam_info = self.make_camera_info(w, h, fovy_deg=55.0)
+        cam_rate = float(self.get_parameter('camera_rate').value)
+        # 렌더(수십 ms)가 물리 틱을 막지 않도록 별도 콜백 그룹 + 상태 락
+        self.state_lock = threading.Lock()
+        self.cam_group = MutuallyExclusiveCallbackGroup()
+        self.create_timer(1.0 / cam_rate, self.tick_camera,
+                          callback_group=self.cam_group)
+
         # 물리 스텝: publish_rate 주기마다 실시간 분량만큼 서브스텝
         rate = float(self.get_parameter('publish_rate').value)
         self.substeps = max(1, round(1.0 / rate / self.model.opt.timestep))
         self.create_timer(1.0 / rate, self.tick)
         self.get_logger().info(
-            f'시뮬 시작: {rate}Hz 퍼블리시, 스텝당 {self.substeps} 서브스텝')
+            f'시뮬 시작: {rate}Hz 퍼블리시, 스텝당 {self.substeps} 서브스텝, '
+            f'카메라 {w}x{h}@{cam_rate}Hz → {base}/rgb_image[/compressed]')
 
     # ---------- 콜백 ----------
     def on_cmd_vel(self, msg: McLocomotionVelocity):
@@ -134,10 +230,11 @@ class X2SimNode(Node):
 
     # ---------- 메인 루프 ----------
     def tick(self):
-        for _ in range(self.substeps):
-            self.apply_pd()
-            self.apply_locomotion()
-            mujoco.mj_step(self.model, self.data)
+        with self.state_lock:
+            for _ in range(self.substeps):
+                self.apply_pd()
+                self.apply_locomotion()
+                mujoco.mj_step(self.model, self.data)
         self.publish_joints()
         self.publish_imu()
         self.seq += 1
@@ -183,6 +280,47 @@ class X2SimNode(Node):
             self.data.qvel[0] = c * self.cmd_vel[0] - s * self.cmd_vel[1]
             self.data.qvel[1] = s * self.cmd_vel[0] + c * self.cmd_vel[1]
             self.data.qvel[5] = self.cmd_vel[2]
+
+    # ---------- 카메라 ----------
+    def make_camera_info(self, w, h, fovy_deg):
+        info = CameraInfo()
+        info.width = w
+        info.height = h
+        fy = (h / 2.0) / math.tan(math.radians(fovy_deg) / 2.0)
+        cx, cy = w / 2.0, h / 2.0
+        info.k = [fy, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        info.p = [fy, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+        info.distortion_model = 'plumb_bob'
+        info.d = [0.0] * 5
+        info.header.frame_id = CAMERA_NAME
+        return info
+
+    def tick_camera(self):
+        with self.state_lock:
+            self.renderer.update_scene(self.data, camera=CAMERA_NAME)
+        rgb = self.renderer.render()          # (H, W, 3) uint8
+        stamp = self.get_clock().now().to_msg()
+
+        buf = io.BytesIO()
+        PILImage.fromarray(rgb).save(buf, format='JPEG',
+                                     quality=self.jpeg_quality)
+        comp = CompressedImage()
+        comp.header.stamp = stamp
+        comp.header.frame_id = CAMERA_NAME
+        comp.format = 'jpeg'
+        comp.data = buf.getvalue()
+        self.pub_img_comp.publish(comp)
+
+        raw = Image()
+        raw.header = comp.header
+        raw.height, raw.width = rgb.shape[0], rgb.shape[1]
+        raw.encoding = 'rgb8'
+        raw.step = rgb.shape[1] * 3
+        raw.data = rgb.tobytes()
+        self.pub_img_raw.publish(raw)
+
+        self.cam_info.header.stamp = stamp
+        self.pub_cam_info.publish(self.cam_info)
 
     # ---------- 퍼블리시 ----------
     def stamp_header(self, header):
@@ -237,8 +375,10 @@ class X2SimNode(Node):
 def main():
     rclpy.init()
     node = X2SimNode()
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

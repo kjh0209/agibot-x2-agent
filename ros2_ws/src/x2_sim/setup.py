@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'sim_node = x2_sim.sim_node:main',
+            'mjpeg_server = x2_sim.mjpeg_server:main',
         ],
     },
 )
