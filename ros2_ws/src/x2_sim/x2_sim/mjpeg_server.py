@@ -8,12 +8,14 @@ http://localhost:8080 에서 브라우저로 스트리밍한다.
   /snapshot.jpg 최신 프레임 1장
 """
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
+from std_srvs.srv import Trigger
 
 TOPIC = '/aima/hal/sensor/rgbd_head_front/rgb_image/compressed'
 PORT = 8080
@@ -25,14 +27,27 @@ INDEX_HTML = """<!doctype html>
  body{background:#111;color:#eee;font-family:sans-serif;text-align:center}
  img{max-width:95%;border:2px solid #444;border-radius:8px;margin-top:12px}
  code{background:#222;padding:2px 6px;border-radius:4px}
+ button{background:#c0392b;color:#fff;border:0;border-radius:8px;
+        padding:10px 22px;font-size:15px;cursor:pointer;margin-top:14px}
+ button:hover{background:#e74c3c}
+ #st{margin-left:12px;color:#8f8}
 </style>
 <h2>Agibot X2 — 로봇이 보는 화면 (시뮬)</h2>
 <img src="/stream" alt="robot view">
-<p>이동 테스트 (다른 터미널에서):</p>
-<p><code>docker exec -it agibot-dev bash -c "source /scripts/env_x2.sh &&
-ros2 topic pub --once /aima/mc/locomotion/velocity
-aimdk_msgs/msg/McLocomotionVelocity
-'{source: agent, forward_velocity: 0.3}'"</code></p>
+<div>
+ <button onclick="doReset()">🔄 시뮬 초기화 (처음 위치로)</button>
+ <span id="st"></span>
+</div>
+<script>
+function doReset(){
+  const st=document.getElementById('st');
+  st.textContent='초기화 중...';
+  fetch('/reset',{method:'POST'})
+    .then(r=>r.text()).then(t=>{st.textContent=t;
+      setTimeout(()=>st.textContent='',4000);})
+    .catch(e=>{st.textContent='실패: '+e;});
+}
+</script>
 """
 
 
@@ -63,12 +78,40 @@ class ViewerNode(Node):
         self.create_subscription(
             CompressedImage, TOPIC,
             lambda m: store.put(bytes(m.data)), qos_profile_sensor_data)
+        self.reset_cli = self.create_client(Trigger, '/x2_sim/reset')
         self.get_logger().info(f'구독: {TOPIC} → http://0.0.0.0:{PORT}')
+
+    def call_reset(self, timeout=5.0):
+        if not self.reset_cli.wait_for_service(timeout_sec=2.0):
+            return False, '시뮬 노드가 응답하지 않아요 (sim_node 실행 중인지 확인)'
+        fut = self.reset_cli.call_async(Trigger.Request())
+        deadline = time.monotonic() + timeout
+        while not fut.done():
+            if time.monotonic() > deadline:
+                return False, '초기화 응답 시간 초과'
+            time.sleep(0.05)
+        r = fut.result()
+        return r.success, r.message
+
+
+viewer_node = None  # main()에서 주입
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # 요청 로그 소음 제거
         pass
+
+    def do_POST(self):
+        if self.path == '/reset':
+            ok, msg = viewer_node.call_reset()
+            body = msg.encode()
+            self.send_response(200 if ok else 500)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
 
     def do_GET(self):
         if self.path == '/':
@@ -113,8 +156,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global viewer_node
     rclpy.init()
     node = ViewerNode()
+    viewer_node = node
     server = ThreadingHTTPServer(('0.0.0.0', PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:

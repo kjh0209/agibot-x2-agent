@@ -24,6 +24,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu
+from std_srvs.srv import Trigger
 
 from aimdk_msgs.msg import JointState, JointStateArray, McLocomotionVelocity
 
@@ -187,6 +188,8 @@ class X2SimNode(Node):
 
         # MC 목 서비스 (실기 프로토콜 강제: 모드/소스 게이트)
         self.mc = McMock(self)
+        # 시뮬 전용 리셋 서비스 (웹 버튼/CLI에서 호출)
+        self.create_service(Trigger, '/x2_sim/reset', self.on_reset)
         # 프리셋 모션 애니메이션 상태: (이름, 시작 sim time) 또는 None
         self.motion = None
         self.jname_to_ai = {n: i for i, n in enumerate(self.joint_names)}
@@ -227,6 +230,27 @@ class X2SimNode(Node):
             f'카메라 {w}x{h}@{cam_rate}Hz → {base}/rgb_image[/compressed]')
 
     # ---------- 콜백 ----------
+    def on_reset(self, req, res):
+        """시뮬을 최초 상태로 완전 초기화 (물리/베이스/모션/MC 상태)."""
+        with self.state_lock:
+            mujoco.mj_resetData(self.model, self.data)
+            mujoco.mj_forward(self.model, self.data)
+            self.q_ref = np.array(
+                [self.data.qpos[a] for a in self.act_qpos_adr])
+            self.cmd_vel = np.zeros(3)
+            self.cmd_time = 0.0
+            self.motion = None
+            self.base_xyz = np.array(self.data.qpos[0:3])
+            qw, qx, qy, qz = self.data.qpos[3:7]
+            self.base_yaw = math.atan2(2 * (qw * qz + qx * qy),
+                                       1 - 2 * (qy * qy + qz * qz))
+            self.prev_base_linvel = np.zeros(3)
+        self.mc.reset()
+        self.get_logger().info('시뮬 초기화 완료 (초기 자세/위치/MC 상태)')
+        res.success = True
+        res.message = '시뮬 초기화 완료'
+        return res
+
     def on_cmd_vel(self, msg: McLocomotionVelocity):
         # 실기 의미론 게이트: locomotion 모드 + 등록된 소스가 아니면 무시
         if not self.mc.gate_velocity(msg.source):

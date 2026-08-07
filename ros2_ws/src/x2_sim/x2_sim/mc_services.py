@@ -97,6 +97,12 @@ class McMock:
         self.log.info(
             'MC 목 서비스 활성 — 시작 액션 STAND_DEFAULT(200), 소스 rc')
 
+    def reset(self):
+        """공장 초기 상태로 복원 (시뮬 리셋용)."""
+        self.sources = {'rc': {'priority': 100, 'enabled': True}}
+        self.current_action = int(McAction.STAND_DEFAULT)
+        self.log.info('MC 상태 초기화: STAND_DEFAULT, 소스 rc만 유지')
+
     # ---------- 게이트 (sim_node가 velocity 콜백에서 호출) ----------
     def gate_velocity(self, source: str) -> bool:
         """실기 의미론: locomotion 모드 + 등록/활성 소스일 때만 True."""
