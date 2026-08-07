@@ -1,0 +1,20 @@
+services:
+  dev:
+    build: .
+    image: agibot-x2-dev:humble
+    container_name: agibot-dev
+    # ros2_ws(워크스페이스)와 sdk를 컨테이너에 마운트
+    volumes:
+      - ../ros2_ws:/ws
+      - ../sdk:/sdk
+    environment:
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - MUJOCO_GL=osmesa
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    # Phase 4 채팅 앱/영상 스트림 포트 (호스트 브라우저에서 접속)
+    ports:
+      - "8000:8000"   # FastAPI (채팅 백엔드)
+      - "8080:8080"   # web_video_server / MJPEG
+      - "9090:9090"   # rosbridge websocket
+    stdin_open: true
+    tty: true

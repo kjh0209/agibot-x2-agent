@@ -1,0 +1,25 @@
+# 비밀키 — 절대 커밋 금지
+.env
+*.key
+
+# 대용량 원본 문서 (PDF 78MB — Git에 넣지 않음)
+*.pdf
+
+# SDK/시뮬 산출물
+sdk/downloads/
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# OS/에디터
+.DS_Store
+.vscode/
