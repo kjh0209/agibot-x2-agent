@@ -125,6 +125,20 @@ document.getElementById('btn-reset').addEventListener('click', () => {
     });
 });
 
+/* ---------- 기능 레지스트리 기반 UI 노출 (A-0) ----------
+   sim 전용 컨트롤(월드 드롭다운/리셋)은 백엔드 /features가
+   허용할 때만 표시 — 실기 모드에서 자동으로 사라진다. */
+fetch('/features').then(r => r.json()).then(f => {
+  if (!f.ui.world_switch) {
+    const el = document.getElementById('world-sel');
+    if (el) el.style.display = 'none';
+  }
+  if (!f.ui.sim_reset) {
+    const el = document.getElementById('btn-reset');
+    if (el) el.style.display = 'none';
+  }
+}).catch(() => {});
+
 /* ---------- 월드 선택 ---------- */
 const worldSel = document.getElementById('world-sel');
 function loadWorlds() {

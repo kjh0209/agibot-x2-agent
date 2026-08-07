@@ -182,7 +182,12 @@ class Bridge(Node):
 
     def hard_stop(self):
         vel = McLocomotionVelocity()
-        vel.source = 'rc'
+        # A-2①: 시뮬은 rc(목 기본 등록 소스)로 0 발행이 안전하지만,
+        # 실기에서 rc 사칭은 실제 리모컨과의 중재가 미검증 —
+        # real 모드는 등록된 agent 소스로 0을 발행한다.
+        # (물리 리모컨 = 진짜 rc는 이와 별개인 3중 정지 경로로 유지)
+        from robot_agent.features import ROBOT_TARGET
+        vel.source = 'rc' if ROBOT_TARGET == 'sim' else 'agent'
         self.pub_vel.publish(vel)
         self.pub_hard_stop.publish(String(data='chat_ui_button'))
         self.get_logger().warning('하드와이어 정지 (채팅 UI 버튼)')
@@ -233,6 +238,14 @@ async def status():
 async def stop():
     bridge.hard_stop()
     return Response('정지 발행 완료 (LLM 독립 경로)', media_type='text/plain')
+
+
+@app.get('/features')
+async def get_features():
+    """기능 레지스트리 파생 UI 노출 정보 (A-0) — 프론트가 이걸 보고
+    sim 전용 컨트롤(월드 드롭다운/리셋)을 숨긴다."""
+    from robot_agent import features as feat
+    return {'robot_target': feat.ROBOT_TARGET, 'ui': feat.ui_flags()}
 
 
 @app.get('/worlds')
@@ -319,12 +332,24 @@ app.mount('/static', StaticFiles(directory=FRONT_DIR), name='static')
 
 def main():
     global bridge
+    # A-4: 단일 인스턴스 강제 — 좀비 백엔드 이중 저장 사고 재발 방지
+    from x2_sim.single_instance import claim
+    _lock = claim('chat_backend')      # noqa: F841 — 수명 유지용
     rclpy.init()
     bridge = Bridge()
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(bridge)
     threading.Thread(target=executor.spin, daemon=True).start()
-    uvicorn.run(app, host='0.0.0.0', port=8000, log_level='warning')
+    try:
+        # timeout_graceful_shutdown: MJPEG /stream 같은 무한 연결이
+        # 우아한 종료를 영원히 붙잡아 SIGTERM 불사신(좀비)이 되는 것 방지
+        uvicorn.run(app, host='0.0.0.0', port=8000, log_level='warning',
+                    timeout_graceful_shutdown=3)
+    finally:
+        # 8000 바인드 실패 등으로 uvicorn이 끝나면 rclpy 스레드가
+        # 프로세스를 붙잡지 않도록 확실히 종료 (좀비화 방지)
+        import os as _os
+        _os._exit(0)
 
 
 if __name__ == '__main__':

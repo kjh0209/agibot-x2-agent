@@ -17,7 +17,7 @@ import threading
 
 import rclpy
 from nav_msgs.msg import Odometry
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -103,8 +103,11 @@ class AgentNode(Node):
                 String(data=f'[{kind}] {text}')))
         self._busy = threading.Lock()
 
-        # 채팅 처리는 전용 콜백 그룹 (툴의 서비스 대기 동안 다른 콜백 허용)
-        chat_group = MutuallyExclusiveCallbackGroup()
+        # 채팅 처리는 ★Reentrant 그룹 — MutuallyExclusive면 LLM 턴이
+        # 도는 동안 "멈춰"의 fast-path 콜백까지 큐에서 대기하게 되어
+        # '정지는 무엇에도 의존 금지' 원칙이 깨진다 (스모크 테스트 [6]이
+        # 실제로 잡아낸 결함). 동시 실행 제어는 _busy 락이 담당.
+        chat_group = ReentrantCallbackGroup()
         self.create_subscription(
             String, '/agent/user_msg', self.on_user_msg, 10,
             callback_group=chat_group)
@@ -227,6 +230,15 @@ class AgentNode(Node):
 
 
 def main():
+    from x2_sim.single_instance import claim
+    _lock = claim('robot_agent')       # noqa: F841 — 수명 유지용
+    # SIGTERM 즉시 종료 — 기본 동작은 rclpy 컨텍스트만 반파된 채
+    # 프로세스가 살아남아 'cannot use Destroyable' 반좀비가 됨 (실측).
+    # 에이전트는 플러시할 영속 상태가 없어(감사 로그는 라인 단위 append)
+    # 즉시 종료가 안전하다.
+    import os as _os
+    import signal as _signal
+    _signal.signal(_signal.SIGTERM, lambda *_: _os._exit(0))
     rclpy.init()
     node = AgentNode()
     executor = MultiThreadedExecutor(num_threads=4)

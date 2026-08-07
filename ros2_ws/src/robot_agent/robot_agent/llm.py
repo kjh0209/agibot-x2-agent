@@ -12,11 +12,13 @@ import os
 
 import anthropic
 
+from robot_agent import features
+
 MODEL = os.environ.get('AGENT_MODEL', 'claude-haiku-4-5')
 MAX_TOKENS = 800
 MAX_HISTORY_TURNS = 12   # user/assistant 쌍 기준 대략치
 
-SYSTEM = """\
+SYSTEM_BASE = """\
 너는 Agibot X2 휴머노이드 로봇이다. 이름은 "엑스". 사용자와 채팅으로
 대화하며, 너의 눈(머리 카메라)으로 세상을 보고 몸을 움직일 수 있다.
 
@@ -41,28 +43,7 @@ SYSTEM = """\
 - "멈춰"는 최우선 — 즉시 stop을 호출한다.
 
 # 몸에 대한 사실
-- 너는 팔 2개(7자유도), 다리 2개, 허리, 머리를 가진 휴머노이드다.
-- 작은 물체는 집고(pick_up) 내려놓을(put_down) 수 있다. 집을 수 있는
-  물체와 거리는 상태의 nearby_objects_dist_m에 있다(영문 이름 사용:
-  apple, mug 등 — 사용자가 "사과"라고 하면 apple로 매핑). 0.95m보다
-  멀면 먼저 move로 접근한다. 들고 있는 것은 holding에 표시된다.
-  한 번에 하나만 들 수 있다.
-- 고개 돌리기는 preset(POINT_HEAD/SHAKE_HEAD)에는 있지만 특정 각도로
-  돌리는 기능은 아직 없다 — 대신 몸 전체를 move(wz)로 돌릴 수 있다.
-- 기본 공간은 집(home)이며 거실/주방/현관/소파/냉장고로 걸어서 이동한다
-  (go_to_place — 물건을 든 채로도 이동 가능). "소파에 앉아" 요청 흐름:
-  go_to_place('소파') → 도착하면 자동으로 소파를 등지고 서므로 →
-  sit_down. 들고/앉은 상태는 반드시 상태값(holding, mode)으로 확인하고
-  추측으로 말하지 않는다.
-- 넘어졌는지는 화면 느낌으로 추측하지 말고 반드시 get_status의
-  upright 값으로 판단한다. upright=true면 서 있는 것이다. 화면이
-  이상하면 대부분 장애물에 부딪혀 이동이 차단됐거나 고개가 밀린 것.
-- 장애물(테이블 등)에 닿으면 이동이 자동 차단된다. 이동했는데 화면이
-  안 변하면 막힌 것이니 다른 방향을 시도하거나 사용자에게 알린다.
-- get_status의 position(현재 좌표)과 from_start(시작점 기준 변위)로
-  자기 위치를 안다. "처음 위치로 돌아가"는 from_start의 dx, dy를
-  역방향으로 이동해서 수행할 수 있다 (yaw_deg를 고려해 몸 기준
-  방향으로 환산할 것).
+{BODY_FACTS}
 
 # 안전 규칙
 - 사람·장애물에 가까워 보이면 이동을 거절하거나 아주 짧게 움직인다.
@@ -74,7 +55,12 @@ SYSTEM = """\
 - 행동을 하면 무엇을 했는지 한 문장으로 알려준다.
 """
 
-TOOLS = [
+# 신체 사실은 기능 레지스트리에서 파생 — 실기 구성(핸드 유무 등)이
+# 바뀌면 features.py만 고치면 프롬프트 사실도 함께 전환된다 (A-0).
+# 프로세스 수명 동안 고정 문자열이므로 프롬프트 캐시는 그대로 유효.
+SYSTEM = SYSTEM_BASE.replace('{BODY_FACTS}', features.body_facts())
+
+ALL_TOOLS = [
     {
         'name': 'look',
         'description': '머리 카메라의 현재 프레임을 본다. 시각 질문에는 반드시 먼저 호출.',
@@ -186,6 +172,9 @@ TOOLS = [
     },
 ]
 
+# LLM에 노출할 툴 = 레지스트리에서 현재 타깃에 활성인 것만 (A-0)
+TOOLS = [t for t in ALL_TOOLS if t['name'] in features.enabled_tools()]
+
 
 class AgentBrain:
     def __init__(self, executor, on_event=None):
@@ -231,6 +220,10 @@ class AgentBrain:
     # ---------- 툴 실행 ----------
     def _run_tool(self, name, args):
         self.on_event('tool', f'{name}({args})')
+        if not features.is_enabled(name):
+            # 노출 목록에서 이미 빠져 있지만, 히스토리 잔재 등으로
+            # 호출될 경우를 대비한 2차 방어선
+            return {'error': f'{name}은(는) 현재 로봇 구성에서 비활성'}, True
         fn = getattr(self.executor, name, None)
         if fn is None:
             return {'error': f'unknown tool {name}'}, True

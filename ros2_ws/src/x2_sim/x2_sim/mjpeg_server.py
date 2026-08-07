@@ -196,6 +196,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global viewer_node
+    from x2_sim.single_instance import claim
+    _lock = claim('mjpeg_server')      # noqa: F841 — 수명 유지용
     rclpy.init()
     node = ViewerNode()
     viewer_node = node

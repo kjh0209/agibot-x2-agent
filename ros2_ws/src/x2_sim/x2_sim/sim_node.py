@@ -904,6 +904,8 @@ class X2SimNode(Node):
 
 
 def main():
+    from x2_sim.single_instance import claim
+    _lock = claim('x2_sim')            # noqa: F841 — 수명 유지용
     rclpy.init()
     node = X2SimNode()
     executor = MultiThreadedExecutor(num_threads=3)

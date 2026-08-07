@@ -44,7 +44,8 @@ AUDIT_PATH = os.environ.get('AGENT_AUDIT_LOG', '/ws/log/tool_audit.jsonl')
 # sim/real 전환 (로드맵 원칙: 설정만으로 전환)
 #   sim  — speak/emoji를 UI 토픽으로 (시뮬에는 스피커/표정화면 없음)
 #   real — 실기 PlayTts/PlayEmoji 서비스 호출
-ROBOT_TARGET = os.environ.get('ROBOT_TARGET', 'sim')
+# sim/real 판정의 단일 소스는 기능 레지스트리 (A-0)
+from robot_agent.features import ROBOT_TARGET
 
 # 표정 문자열 → 실기 PlayEmoji emotion_id (PlayEmoji.srv 상수에서 확인)
 EMOJI_ID = {
@@ -158,8 +159,24 @@ class ToolExecutor:
                 f'모드 전환 거부: {res.response.message} '
                 f'(현재 제어권이 다른 소스에 있거나 전이 불가 상태)')
 
+    def _wait_mode(self, target: int, timeout: float = 5.0):
+        """A-2②: 모드 전환 '완료'까지 폴링 대기.
+
+        시뮬 McMock은 전환이 즉시라 첫 폴에서 통과하지만, 실기의
+        STAND→LOCOMOTION은 자세를 잡는 시간이 걸린다 — 완료 전에
+        velocity를 쏘면 무시되거나 위험. GetMcAction 폴링으로 실제
+        도달을 확인한다 (sim/real 동일 경로)."""
+        t_end = time.monotonic() + timeout
+        while time.monotonic() < t_end:
+            if self.current_action() == target:
+                return
+            time.sleep(0.2)
+        raise RuntimeError(
+            f'모드 전환 미완료: 목표 {target}, 현재 {self.current_action()} '
+            f'({timeout}s 초과)')
+
     def ensure_mode(self, target: int):
-        """행동 직전 모드 확인 → 필요 시 전환. 캐시 없음."""
+        """행동 직전 모드 확인 → 필요 시 전환 + 완료 대기. 캐시 없음."""
         cur = self.current_action()
         if cur == target:
             return
@@ -167,9 +184,11 @@ class ToolExecutor:
         if target == McAction.LOCOMOTION_DEFAULT and cur not in (
                 McAction.STAND_DEFAULT, McAction.STAND_BODY_CONTROL):
             self.set_action(int(McAction.STAND_DEFAULT))
+            self._wait_mode(int(McAction.STAND_DEFAULT))
         if target in (McAction.STAND_DEFAULT,) and cur == target:
             return
         self.set_action(target)
+        self._wait_mode(target)
 
     # ---------- 툴 구현 ----------
     def look(self):
@@ -302,8 +321,23 @@ class ToolExecutor:
             msg = f'모션 거부됨 (state={res.response.state.value})'
             self.audit('play_motion', args, False, msg)
             return {'error': msg}
-        time.sleep(2.5)  # 동작 완료까지 대기 (블로킹 단순화)
-        self.audit('play_motion', args, True, 'done')
+        # A-2③: 고정 sleep 대신 상태 기반 완료 판정 — 실기는 모션별
+        # 소요가 다르다. 모드가 프리셋 실행으로 바뀌었다 STAND로
+        # 돌아오면 완료. 모드 변화가 안 보이는 구현(시뮬 목)은
+        # 애니메이션 길이(2.5s) 폴백.
+        t0 = time.monotonic()
+        saw_active = False
+        while time.monotonic() - t0 < 12.0:
+            cur = self.current_action()
+            if cur != int(McAction.STAND_DEFAULT):
+                saw_active = True
+            elif saw_active:
+                break                       # 실행 후 STAND 복귀 = 완료
+            elif time.monotonic() - t0 >= 2.5:
+                break                       # 모드 무변화 구현 폴백
+            time.sleep(0.3)
+        self.audit('play_motion', args, True,
+                   f'done ({time.monotonic() - t0:.1f}s)')
         return {'ok': f'{motion} 동작 완료'}
 
     def speak(self, text: str):
