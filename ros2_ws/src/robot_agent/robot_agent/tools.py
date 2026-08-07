@@ -373,9 +373,9 @@ class ToolExecutor:
         msg.angular_velocity = 0.0
         self.pub_vel.publish(msg)
 
-    def _dock_backward(self, max_dist=0.6, timeout=6.0):
-        """뒤로 천천히 물러나 가구(소파 등)에 밀착. 충돌 차단으로 위치가
-        더 이상 줄지 않으면(=닿음) 정지."""
+    def _dock(self, max_dist=0.6, forward=False, timeout=6.0):
+        """천천히 전/후진해 가구(소파·테이블 등)에 밀착. 충돌 차단으로
+        위치가 더 이상 변하지 않으면(=닿음) 정지."""
         import math as m
         start = self.node.odom
         if start is None:
@@ -396,7 +396,7 @@ class ToolExecutor:
             else:
                 stall = 0
             last = pos
-            msg.forward_velocity = -0.12
+            msg.forward_velocity = 0.12 if forward else -0.12
             self.pub_vel.publish(msg)
             time.sleep(0.1)
         msg.forward_velocity = 0.0
@@ -509,8 +509,18 @@ class ToolExecutor:
             pos = self.node.odom or (0.0, 0.0)
             dist0 = ((tx - pos[0]) ** 2 + (ty - pos[1]) ** 2) ** 0.5
             if dist0 < 0.5:
+                # 이미 근처여도 방향 정렬·가구 밀착(도킹)은 수행 —
+                # 놓기/앉기 등 후속 동작의 위치 정밀도를 보장
+                face = entry.get('yaw')
+                if face is not None:
+                    self._rotate_to(face)
+                if entry.get('dock_back'):
+                    self._dock(max_dist=float(entry['dock_back']))
+                elif entry.get('dock_forward'):
+                    self._dock(max_dist=float(entry['dock_forward']),
+                               forward=True)
                 self.audit('go_to_place', args, True, 'already there')
-                return {'ok': f'이미 {place} 근처에 있음'}
+                return {'ok': f'이미 {place} 근처에 있음 (정렬 완료)'}
             # ★방 그래프 라우팅: 현재 방 → (BFS 최단 방 경로) → 목적 방.
             #   각 전이는 [이 방 허브] → 문 → [다음 방 허브] 순 — 허브는
             #   가구 없는 지점이라 티테이블/아일랜드 등을 자연 우회한다.
@@ -580,11 +590,13 @@ class ToolExecutor:
                 face = entry.get('yaw')
                 if face is not None:
                     self._rotate_to(face)   # 예: 소파를 등지고 정렬
-                dock = entry.get('dock_back')
-                if dock:
-                    # 가구에 닿을 때까지 후진 밀착 — 시뮬 충돌 차단이
-                    # 자연스러운 정지 역할을 한다 (진행 정지 감지로 종료)
-                    self._dock_backward(max_dist=float(dock))
+                # 가구에 닿을 때까지 전/후진 밀착 — 시뮬 충돌 차단이
+                # 자연스러운 정지 역할을 한다 (진행 정지 감지로 종료)
+                if entry.get('dock_back'):
+                    self._dock(max_dist=float(entry['dock_back']))
+                elif entry.get('dock_forward'):
+                    self._dock(max_dist=float(entry['dock_forward']),
+                               forward=True)
                 held = f", 들고 있는 것: {self.node.carrying}" \
                     if self.node.carrying else ''
                 result = (f'{place}까지 걸어서 도착 ({dist0:.1f}m, '
@@ -708,8 +720,22 @@ class ToolExecutor:
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and self.node.carrying:
             time.sleep(0.05)
-        self.audit('put_down', {'was': held}, True, 'released')
-        return {'ok': f'{held}을(를) 내려놓음 (그 자리에 떨어짐)'}
+        # 물리 안착 대기 후 실제 착지 결과를 데이터로 보고 —
+        # "테이블에 내려놨어" 같은 추측성 보고 방지 (실측 사고:
+        # 문 앞 바닥에 떨어뜨리고 테이블에 놨다고 답한 confabulation)
+        time.sleep(1.0)
+        obj = self.node.objects.get(held)
+        landed = ''
+        if obj:
+            z = obj.get('z', 0.0)
+            surface = '바닥' if z < 0.3 else f'높이 {z:.2f}m의 표면 위'
+            landed = (f' → 실제 착지: {surface} '
+                      f'(x={obj["x"]:.2f}, y={obj["y"]:.2f})')
+        self.audit('put_down', {'was': held}, True, f'released{landed}')
+        return {'ok': (f'{held}을(를) 손에서 놓음.{landed} — 바닥에 '
+                       f'떨어졌다면 의도한 곳이 아닐 수 있으니 사용자에게 '
+                       f'사실대로 말할 것. 테이블 위에 놓으려면 먼저 '
+                       f'테이블 바로 앞(0.5m 이내)까지 접근해야 함')}
 
     def stop(self):
         self._stop_requested = True

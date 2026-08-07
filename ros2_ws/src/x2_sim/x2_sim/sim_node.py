@@ -120,6 +120,13 @@ def load_model_with_camera_and_props(model_path: str,
             g.size = size
             g.rgba = rgba
             g.density = 300.0     # 가벼운 소품 (물장난 방지)
+            # 구름 마찰 부여 — MuJoCo 기본값(0.0001)은 사실상 0이라
+            # 구형 물체가 테이블에 내려놓는 순간의 미세 충격만으로
+            # 무한정 굴러 떨어짐 (사과 테이블 낙하 실측 사고).
+            # ★rolling 마찰은 condim=6이어야 실제로 적용됨 (condim=3
+            # 기본값에선 friction 3번째 값이 무시됨 — 1차 수정 실패 원인)
+            g.condim = 6
+            g.friction = [1.0, 0.01, 0.02]
             grasp_names.append(name)
         else:
             g = wb.add_geom()
@@ -460,6 +467,22 @@ class X2SimNode(Node):
             if info is not None:            # 접촉 복원 (다시 잡을 수 있게)
                 self.model.geom_contype[info['gid']] = 1
                 self.model.geom_conaffinity[info['gid']] = 1
+                # 놓는 위치를 오른손이 아니라 몸 정면 중앙으로 보정 —
+                # 손 기준으로 놓으면 우측(어깨 오프셋)으로 치우쳐
+                # 테이블 모서리에 떨어지는 사고 (y=2.52 모서리 낙하 실측).
+                # carrying 해제까지 같은 락 안에서 — 락 밖에서 해제하면
+                # 물리 틱의 apply_carry가 물체를 손 위치로 되돌리는 레이스
+                with self.state_lock:
+                    c = math.cos(self.base_yaw)
+                    s = math.sin(self.base_yaw)
+                    adr = info['qpos_adr']
+                    z = float(self.data.qpos[adr + 2])
+                    self.data.qpos[adr] = self.base_xyz[0] + 0.45 * c
+                    self.data.qpos[adr + 1] = self.base_xyz[1] + 0.45 * s
+                    self.data.qpos[adr + 2] = z
+                    vadr = info['qvel_adr']
+                    self.data.qvel[vadr:vadr + 6] = 0.0
+                    self.carrying = None
         self.carrying = None
         self.pub_carrying.publish(String(data=''))
 
