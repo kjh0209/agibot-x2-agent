@@ -88,6 +88,14 @@ class ToolExecutor:
         # 장소 이동(시뮬: 월드 전환) 발행자
         self.pub_set_world = node.create_publisher(
             String, '/x2_sim/set_world', 10)
+        # 집기/놓기 (시뮬 전용 — 실기는 핸드 하드웨어 + HandCommand)
+        self.pub_grasp = node.create_publisher(String, '/x2_sim/grasp', 10)
+        self.pub_release = node.create_publisher(
+            String, '/x2_sim/release', 10)
+        self._grasp_results = []
+        node.create_subscription(
+            String, '/x2_sim/grasp_result',
+            lambda m: self._grasp_results.append(m.data), 10)
 
     def _on_hard_stop(self, msg: String):
         self._stop_requested = True
@@ -190,8 +198,9 @@ class ToolExecutor:
                     f'움직임을 거절함. 충전이 필요함 (안전 가드)')
         return None
 
-    def move(self, vx=0.0, vy=0.0, wz=0.0, duration=1.0):
-        args = {'vx': vx, 'vy': vy, 'wz': wz, 'duration': duration}
+    def move(self, vx=0.0, vy=0.0, wz=0.0, duration=1.0, wait=False):
+        args = {'vx': vx, 'vy': vy, 'wz': wz, 'duration': duration,
+                'wait': wait}
         # 하드 클램프 (LLM이 뭐라 하든 코드가 지킨다)
         vx = max(-MAX_VX, min(MAX_VX, float(vx)))
         vy = max(-MAX_VY, min(MAX_VY, float(vy)))
@@ -248,6 +257,14 @@ class ToolExecutor:
 
         self._move_thread = threading.Thread(target=run, daemon=True)
         self._move_thread.start()
+        if wait:
+            # 복합 작업(접근 후 집기 등): 이동 완료까지 동기 대기
+            self._move_thread.join(timeout=duration + 1.0)
+            st = self.node.status_summary()
+            result = (f'이동 완료(wait). 현재 위치 참고: '
+                      f'{st.get("nearby_objects_dist_m", {})}')
+            self.audit('move', args, True, result)
+            return {'ok': result}
         result = (f'이동 시작함: vx={vx} vy={vy} wz={wz}, {duration}초간. '
                   f'완료는 이벤트로 통지됨 — 사용자에게는 출발했다고만 알리면 됨')
         self.audit('move', args, True, result)
@@ -322,20 +339,140 @@ class ToolExecutor:
         self.audit('show_emoji', {'emoji': emoji}, True, 'sim_ui')
         return {'ok': f'표정 표시: {emoji}'}
 
-    # 장소 이름 → 시뮬 월드 매핑 (실기에서는 SLAM 내비게이션 목적지가 됨)
+    # 장소 이름 별칭 (home 월드 안의 방 / 별도 월드 공통)
     PLACES = {
         '스튜디오': 'studio', 'studio': 'studio',
         '거실': 'living_room', 'living_room': 'living_room',
         '사무실': 'office', 'office': 'office',
         '주방': 'kitchen', '부엌': 'kitchen', 'kitchen': 'kitchen',
+        '현관': 'entrance', 'entrance': 'entrance',
+        '소파': 'sofa', 'sofa': 'sofa',
+        '냉장고': 'fridge', 'fridge': 'fridge',
+        '집': 'home', 'home': 'home',
     }
+
+    def _rotate_to(self, target_yaw, timeout=10.0):
+        """제자리 회전으로 목표 방향 정렬 (소파 등지기 등)."""
+        import math as m
+        msg = McLocomotionVelocity()
+        msg.source = SOURCE
+        t_end = time.monotonic() + timeout
+        while time.monotonic() < t_end and not self._stop_requested:
+            err = (target_yaw - self.node.yaw_rad() + m.pi) % (2 * m.pi) - m.pi
+            if abs(err) < 0.12:
+                break
+            msg.angular_velocity = max(-0.5, min(0.5, 1.2 * err))
+            self.pub_vel.publish(msg)
+            time.sleep(0.1)
+        msg.angular_velocity = 0.0
+        self.pub_vel.publish(msg)
+
+    def _dock_backward(self, max_dist=0.6, timeout=6.0):
+        """뒤로 천천히 물러나 가구(소파 등)에 밀착. 충돌 차단으로 위치가
+        더 이상 줄지 않으면(=닿음) 정지."""
+        import math as m
+        start = self.node.odom
+        if start is None:
+            return
+        msg = McLocomotionVelocity()
+        msg.source = SOURCE
+        last = start
+        stall = 0
+        t_end = time.monotonic() + timeout
+        while time.monotonic() < t_end and not self._stop_requested:
+            pos = self.node.odom
+            if m.hypot(pos[0] - start[0], pos[1] - start[1]) >= max_dist:
+                break
+            if m.hypot(pos[0] - last[0], pos[1] - last[1]) < 0.005:
+                stall += 1
+                if stall >= 5:      # 0.5초간 정지 = 밀착 완료
+                    break
+            else:
+                stall = 0
+            last = pos
+            msg.forward_velocity = -0.12
+            self.pub_vel.publish(msg)
+            time.sleep(0.1)
+        msg.forward_velocity = 0.0
+        self.pub_vel.publish(msg)
+
+    # ---------- 보행 내비게이션 (home 월드: 진짜 걸어서 이동) ----------
+    def _navigate(self, waypoints, timeout=90.0):
+        """웨이포인트를 향해 회전→직진 반복 (velocity 명령만 사용 —
+        실기에서 SLAM 목적지 없이 걷는 방식과 동일). 걷는 과정 전체가
+        카메라에 보인다. stop/하드정지로 언제든 중단 가능."""
+        import math as m
+        self.ensure_source()
+        self.ensure_mode(int(McAction.LOCOMOTION_DEFAULT))
+        self._stop_requested = False
+        msg = McLocomotionVelocity()
+        msg.source = SOURCE
+        t_end = time.monotonic() + timeout
+        best = None
+        best_t = time.monotonic()
+        n_wp = len(waypoints)
+        for i, (wx, wy) in enumerate(waypoints):
+            # 중간 웨이포인트는 느슨하게 통과(0.5m), 최종 목적지만 정밀(0.35m)
+            radius = 0.35 if i == n_wp - 1 else 0.5
+            retried = False
+            while True:
+                if self._stop_requested:
+                    return False, 'stop 요청으로 중단'
+                if time.monotonic() > t_end:
+                    return False, '내비게이션 시간 초과'
+                pos = self.node.odom
+                if pos is None:
+                    return False, '위치 정보 없음'
+                dx, dy = wx - pos[0], wy - pos[1]
+                dist = m.hypot(dx, dy)
+                if dist < radius:
+                    break
+                # 진행 감시: 5초간 거리 개선 없으면 막힌 것
+                if best is None or dist < best - 0.05:
+                    best, best_t = dist, time.monotonic()
+                elif time.monotonic() - best_t > 5.0:
+                    if not retried:
+                        # 언스턱: 1.5초 후진 후 같은 웨이포인트 1회 재시도
+                        retried = True
+                        msg.forward_velocity = -0.2
+                        msg.angular_velocity = 0.0
+                        t_back = time.monotonic() + 1.5
+                        while (time.monotonic() < t_back
+                               and not self._stop_requested):
+                            self.pub_vel.publish(msg)
+                            time.sleep(0.1)
+                        msg.forward_velocity = 0.0
+                        self.pub_vel.publish(msg)
+                        best, best_t = None, time.monotonic()
+                        continue
+                    msg.forward_velocity = 0.0
+                    msg.angular_velocity = 0.0
+                    self.pub_vel.publish(msg)
+                    return False, (f'진행 불가 (장애물 차단 또는 제어권 '
+                                   f'상실) — 남은 거리 {dist:.2f}m')
+                bearing = m.atan2(dy, dx)
+                err = (bearing - self.node.yaw_rad() + m.pi) % (2 * m.pi) - m.pi
+                if abs(err) > 0.35:
+                    msg.forward_velocity = 0.0
+                    msg.angular_velocity = max(-0.5, min(0.5, 1.2 * err))
+                else:
+                    msg.forward_velocity = 0.25
+                    msg.angular_velocity = max(-0.4, min(0.4, err))
+                self.pub_vel.publish(msg)
+                time.sleep(0.1)
+            best, best_t = None, time.monotonic()
+        msg.forward_velocity = 0.0
+        msg.angular_velocity = 0.0
+        self.pub_vel.publish(msg)
+        return True, '도착'
 
     def go_to_place(self, place: str):
         args = {'place': place}
         key = str(place).strip().lower()
         world = self.PLACES.get(key) or self.PLACES.get(str(place).strip())
         if world is None:
-            msg = f'모르는 장소 {place!r}. 갈 수 있는 곳: 스튜디오/거실/사무실/주방'
+            msg = (f'모르는 장소 {place!r}. 갈 수 있는 곳: '
+                   f'거실/주방/현관(집 안 — 걸어서), 스튜디오/사무실(별도 공간)')
             self.audit('go_to_place', args, False, msg)
             return {'error': msg}
         if ROBOT_TARGET == 'real':
@@ -343,9 +480,76 @@ class ToolExecutor:
             msg = '실기 내비게이션은 아직 연결 전 (Phase 6+에서 SLAM 경로로 구현)'
             self.audit('go_to_place', args, False, msg)
             return {'error': msg}
+
+        # ★home 월드 안의 방이면 순간이동이 아니라 실제로 걸어간다
+        from x2_sim.worlds import WORLDS
+        home = WORLDS.get('home', {})
+        places = home.get('places', {})
+        if self.node.current_world == 'home' and world in places:
+            entry = places[world]
+            tx, ty = entry['pos']
+            pos = self.node.odom or (0.0, 0.0)
+            dist0 = ((tx - pos[0]) ** 2 + (ty - pos[1]) ** 2) ** 0.5
+            if dist0 < 0.5:
+                self.audit('go_to_place', args, True, 'already there')
+                return {'ok': f'이미 {place} 근처에 있음'}
+            # ★허브 라우팅: 방마다 가구 없는 허브를 두고
+            #   내 방 허브 → 문 → 상대 방 허브 → (목적지별 경유점) → 목적지
+            # 순으로 걸어 가구(티테이블/아일랜드)를 우회한다.
+            hubs = home.get('hubs', {})
+
+            def side(y):
+                return 'living' if y > 0.6 else (
+                    'kitchen' if y < -0.6 else None)
+
+            s, t = side(pos[1]), side(ty)
+            waypoints = []
+            if s is not None and s != t and s in hubs:
+                waypoints.append(tuple(hubs[s]))
+            if s is not None and t is not None and s != t:
+                waypoints.append(tuple(home['doorway']))
+            if t is not None and s != t and t in hubs:
+                waypoints.append(tuple(hubs[t]))
+            waypoints += [tuple(v) for v in entry.get('via', [])]
+            waypoints.append((tx, ty))
+            # 현재 위치와 겹치거나 연속으로 겹치는 웨이포인트 정리
+            pruned = []
+            px, py = pos
+            for wx, wy in waypoints:
+                if ((wx - px) ** 2 + (wy - py) ** 2) ** 0.5 < 0.45 \
+                        and (wx, wy) != (tx, ty):
+                    continue
+                if pruned and ((wx - pruned[-1][0]) ** 2
+                               + (wy - pruned[-1][1]) ** 2) ** 0.5 < 0.3:
+                    continue
+                pruned.append((wx, wy))
+            t0 = time.monotonic()
+            ok, detail = self._navigate(pruned)
+            took = time.monotonic() - t0
+            if ok:
+                face = entry.get('yaw')
+                if face is not None:
+                    self._rotate_to(face)   # 예: 소파를 등지고 정렬
+                dock = entry.get('dock_back')
+                if dock:
+                    # 가구에 닿을 때까지 후진 밀착 — 시뮬 충돌 차단이
+                    # 자연스러운 정지 역할을 한다 (진행 정지 감지로 종료)
+                    self._dock_backward(max_dist=float(dock))
+                held = f", 들고 있는 것: {self.node.carrying}" \
+                    if self.node.carrying else ''
+                result = (f'{place}까지 걸어서 도착 ({dist0:.1f}m, '
+                          f'{took:.0f}초 소요{held}). look으로 주변 확인 가능')
+                self.audit('go_to_place', args, True, result)
+                return {'ok': result}
+            self.audit('go_to_place', args, False, detail)
+            return {'error': f'{place}로 가는 중 문제: {detail}'}
+
         if self.node.current_world == world:
             self.audit('go_to_place', args, True, 'already there')
             return {'ok': f'이미 {place}에 있음'}
+        if world not in ('studio', 'office', 'living_room', 'kitchen', 'home'):
+            return {'error': f'{place}는 현재 공간({self.node.current_world})'
+                             f'에 없음 — 집(home)에서만 갈 수 있는 곳'}
         # 발행 → latched 월드 토픽으로 도착 확인 (유실 대비 재시도)
         arrived = False
         for _ in range(3):
@@ -363,9 +567,94 @@ class ToolExecutor:
             self.audit('go_to_place', args, False, msg)
             return {'error': msg}
         self.node.latest_frame(fresh=True, timeout=2.0)  # 새 씬 프레임 대기
+        dropped = ''
+        if self.node.carrying:
+            dropped = ' ★공간 전환으로 들고 있던 물건은 원래 자리로 돌아감'
         self.audit('go_to_place', args, True, f'world={world}')
-        return {'ok': (f'{place}에 도착함 (시뮬: 씬 전환 방식이라 위치가 '
-                       f'초기화됨). look으로 새 장소를 확인해 알려줄 것')}
+        return {'ok': (f'{place}(별도 공간)으로 전환됨. 위치 초기화됨.'
+                       f'{dropped} look으로 확인해 알려줄 것')}
+
+    def sit_down(self):
+        """앉기 — 실기 McAction SIT_DOWN_DEFAULT(2000)와 동일 의미론."""
+        try:
+            self.ensure_source()
+            self.ensure_mode(int(McAction.STAND_DEFAULT))
+            self.set_action(int(McAction.SIT_DOWN_DEFAULT))
+        except RuntimeError as e:
+            self.audit('sit_down', {}, False, str(e))
+            return {'error': str(e)}
+        held = f' (들고 있는 것: {self.node.carrying})' \
+            if self.node.carrying else ' (빈손)'
+        self.audit('sit_down', {}, True, 'seated')
+        return {'ok': f'앉았음.{held} 앉은 동안 이동 불가 — stand_up으로 일어남'}
+
+    def stand_up(self):
+        """일어서기 — 실기 McAction STAND_UP_DEFAULT(2005)."""
+        try:
+            self.ensure_source()
+            self.set_action(int(McAction.STAND_UP_DEFAULT))
+        except RuntimeError as e:
+            self.audit('stand_up', {}, False, str(e))
+            return {'error': str(e) + ' (앉아있지 않으면 실패함)'}
+        self.audit('stand_up', {}, True, 'standing')
+        return {'ok': '일어섰음 (STAND_DEFAULT)'}
+
+    def pick_up(self, object_name: str):
+        args = {'object_name': object_name}
+        if ROBOT_TARGET == 'real':
+            msg = ('실기 집기는 핸드 하드웨어(옵션) + HandCommand 연동 필요 '
+                   '— Phase 6+에서 구현')
+            self.audit('pick_up', args, False, msg)
+            return {'error': msg}
+        name = str(object_name).strip()
+        if self.node.carrying:
+            msg = f'이미 {self.node.carrying}을(를) 들고 있음 — 먼저 put_down'
+            self.audit('pick_up', args, False, msg)
+            return {'error': msg}
+        if name not in self.node.objects:
+            msg = (f'주변에 {name!r} 없음. 현재 집을 수 있는 물체: '
+                   f'{list(self.node.objects)}')
+            self.audit('pick_up', args, False, msg)
+            return {'error': msg}
+        n0 = len(self._grasp_results)
+        self.pub_grasp.publish(String(data=name))
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if len(self._grasp_results) > n0:
+                result = self._grasp_results[-1]
+                break
+            time.sleep(0.05)
+        else:
+            msg = '집기 응답 없음 (시뮬 노드 확인 필요)'
+            self.audit('pick_up', args, False, msg)
+            return {'error': msg}
+        if result.startswith('ok:'):
+            self.audit('pick_up', args, True, result)
+            return {'ok': f'{name}을(를) 집었음. 들고 이동 가능'}
+        if 'too_far' in result:
+            dist = result.rsplit(':', 1)[-1]
+            msg = (f'{name}이(가) 너무 멂 (거리 {dist}m, 도달 반경 0.95m) '
+                   f'— 먼저 move로 가까이 접근 후 재시도')
+        elif 'hands_full' in result:
+            msg = '손이 차 있음 — put_down 먼저'
+        else:
+            msg = f'집기 실패: {result}'
+        self.audit('pick_up', args, False, msg)
+        return {'error': msg}
+
+    def put_down(self):
+        if ROBOT_TARGET == 'real':
+            return {'error': '실기 집기/놓기는 Phase 6+ 구현 예정'}
+        if not self.node.carrying:
+            self.audit('put_down', {}, False, 'not carrying')
+            return {'error': '들고 있는 물체가 없음'}
+        held = self.node.carrying
+        self.pub_release.publish(String(data=''))
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and self.node.carrying:
+            time.sleep(0.05)
+        self.audit('put_down', {'was': held}, True, 'released')
+        return {'ok': f'{held}을(를) 내려놓음 (그 자리에 떨어짐)'}
 
     def stop(self):
         self._stop_requested = True

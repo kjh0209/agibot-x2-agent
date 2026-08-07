@@ -20,7 +20,7 @@ from std_srvs.srv import Trigger
 
 from aimdk_msgs.msg import McLocomotionVelocity
 
-TOPIC = '/aima/hal/sensor/rgbd_head_front/rgb_image/compressed'
+TOPIC = '/x2_sim/preview/compressed'   # 라이브 프리뷰(저해상 고빈도)
 PORT = 8080
 
 INDEX_HTML = """<!doctype html>

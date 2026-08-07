@@ -75,6 +75,19 @@ class AgentNode(Node):
         self.create_subscription(
             String, '/x2_sim/world',
             lambda m: setattr(self, 'current_world', m.data), latched)
+        # 주변 물체 + 들고 있는 물체
+        import json as _json
+        self.objects = {}
+        self.carrying = ''
+        self.create_subscription(
+            String, '/x2_sim/objects',
+            lambda m: setattr(self, 'objects',
+                              _json.loads(m.data).get('objects', {})), 10)
+        latched3 = QoSProfile(depth=1)
+        latched3.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            String, '/x2_sim/carrying',
+            lambda m: setattr(self, 'carrying', m.data), latched3)
 
         # ---------- 출력 ----------
         self.pub_reply = self.create_publisher(String, '/agent/reply', 10)
@@ -118,6 +131,10 @@ class AgentNode(Node):
             self.frame_count += 1
             self.frame_cond.notify_all()
 
+    def yaw_rad(self) -> float:
+        w, x, y, z = self.imu_quat
+        return math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
     # ---------- ToolExecutor가 쓰는 인터페이스 ----------
     def latest_frame(self, fresh: bool = True, timeout: float = 1.5):
         """최신 프레임 반환. fresh=True면 '호출 이후 도착한' 프레임을
@@ -145,7 +162,16 @@ class AgentNode(Node):
             'upright': abs(roll) < 30 and abs(pitch) < 30,
             'battery_pct': self.battery_pct,
             'place': self.current_world,
+            'holding': self.carrying or None,
         }
+        if self.objects and self.odom:
+            rx, ry = self.odom
+            nearby = {}
+            for name, p in self.objects.items():
+                d = math.hypot(p['x'] - rx, p['y'] - ry)
+                nearby[name] = round(d, 2)
+            st['nearby_objects_dist_m'] = dict(
+                sorted(nearby.items(), key=lambda kv: kv[1]))
         if self.odom:
             st['position'] = {'x': round(self.odom[0], 2),
                               'y': round(self.odom[1], 2)}

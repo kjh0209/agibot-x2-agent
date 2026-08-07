@@ -12,8 +12,10 @@
   /aima/mc/locomotion/velocity                 aimdk_msgs/McLocomotionVelocity
 """
 import io
+import json
 import math
 import threading
+import time
 
 import mujoco
 import numpy as np
@@ -101,17 +103,41 @@ def load_model_with_camera_and_props(model_path: str,
         light.diffuse = diffuse
         light.castshadow = False
 
-    prop_names = []
-    for name, gtype, size, pos, rgba in world['props']:
-        g = wb.add_geom()
-        g.name = name
-        g.type = GEOM_TYPES[gtype]
-        g.size = size
-        g.pos = pos
-        g.rgba = rgba
-        prop_names.append(name)
+    static_names, grasp_names = [], []
+    for entry in world['props']:
+        name, gtype, size, pos, rgba = entry[:5]
+        opts = entry[5] if len(entry) > 5 else {}
+        if opts.get('grasp'):
+            # 집기 가능 물체 = 자유 물체(freejoint) — 밀리고 떨어지는
+            # 실제 물리 오브젝트. 로봇이 집으면 키네마틱 캐리로 부착.
+            b = wb.add_body()
+            b.name = name
+            b.pos = pos
+            b.add_freejoint()
+            g = b.add_geom()
+            g.name = name
+            g.type = GEOM_TYPES[gtype]
+            g.size = size
+            g.rgba = rgba
+            g.density = 300.0     # 가벼운 소품 (물장난 방지)
+            grasp_names.append(name)
+        else:
+            g = wb.add_geom()
+            g.name = name
+            g.type = GEOM_TYPES[gtype]
+            g.size = size
+            g.pos = pos
+            g.rgba = rgba
+            static_names.append(name)
 
-    return spec.compile(), prop_names
+    model = spec.compile()
+    # CPU(OSMesa) 렌더 최적화 — 실측: 그림자맵 4096 + MSAA 4x가 프레임당
+    # ~1.2s를 차지 (해상도 무관 고정비용). 끄면 640x480 기준 1.9s→0.5s.
+    model.vis.quality.shadowsize = 256
+    model.vis.quality.offsamples = 0
+    for i in range(model.nlight):
+        model.light_castshadow[i] = 0
+    return model, static_names, grasp_names
 
 
 class X2SimNode(Node):
@@ -139,8 +165,13 @@ class X2SimNode(Node):
         w = int(self.get_parameter('camera_width').value)
         h = int(self.get_parameter('camera_height').value)
         self.cam_size = (w, h)
+        self.declare_parameter('preview_width', 320)
+        self.declare_parameter('preview_height', 240)
+        self.prev_size = (int(self.get_parameter('preview_width').value),
+                          int(self.get_parameter('preview_height').value))
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.renderer = None
+        self.renderer_prev = None
         self.seq = 0
 
         # 월드 로드 (모델/매핑/베이스/소품/렌더러 전부 이 안에서 구성 —
@@ -188,6 +219,23 @@ class X2SimNode(Node):
             String, '/x2_sim/set_world', self.on_set_world, 10)
         self.pub_world.publish(String(data=self.world_name))
 
+        # 집기/놓기 인터페이스 (시뮬 전용 — 실기는 핸드 하드웨어+HandCommand)
+        latched2 = QoSProfile(depth=1)
+        latched2.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.pub_carrying = self.create_publisher(
+            String, '/x2_sim/carrying', latched2)
+        self.pub_grasp_result = self.create_publisher(
+            String, '/x2_sim/grasp_result', 10)
+        self.create_subscription(
+            String, '/x2_sim/grasp', self.on_grasp, 10)
+        self.create_subscription(
+            String, '/x2_sim/release', self.on_release, 10)
+        self.pub_carrying.publish(String(data=''))
+        # 주변 물체 브로드캐스트 (에이전트 상태 주입용)
+        self.pub_objects = self.create_publisher(
+            String, '/x2_sim/objects', 10)
+        self.create_timer(1.0, self.publish_objects)
+
         # ---------- 카메라 (Phase 2: 로봇이 보는 화면) ----------
         # 실기 토픽명 그대로. compressed가 주 소비 경로(실기 WiFi 대역폭 대비),
         # raw는 디버깅/후처리용.
@@ -206,9 +254,20 @@ class X2SimNode(Node):
         # render_lock: 월드 전환 시 렌더러 교체와 렌더링의 경합 방지
         self.state_lock = threading.Lock()
         self.render_lock = threading.Lock()
+        self.prev_lock = threading.Lock()
         self.cam_group = MutuallyExclusiveCallbackGroup()
         self.create_timer(1.0 / cam_rate, self.tick_camera,
                           callback_group=self.cam_group)
+        # ---------- 라이브 프리뷰 스트림 ----------
+        # UI용 저해상도 연속 렌더 — 별도 스레드가 쉬지 않고 렌더해서
+        # CPU(OSMesa)가 허용하는 최대 fps로 발행. look()용 고해상 640x480
+        # 스트림(위)과 분리해 '부드러운 영상'과 '선명한 스냅샷'을 양립.
+        self.pub_preview = self.create_publisher(
+            CompressedImage, '/x2_sim/preview/compressed',
+            qos_profile_sensor_data)
+        self._preview_thread = threading.Thread(
+            target=self._preview_loop, daemon=True)
+        self._preview_thread.start()
 
         # 물리 스텝: publish_rate 주기마다 실시간 분량만큼 서브스텝
         rate = float(self.get_parameter('publish_rate').value)
@@ -233,9 +292,26 @@ class X2SimNode(Node):
         if world_name not in self._world_cache:
             self._world_cache[world_name] = load_model_with_camera_and_props(
                 model_path, world_name)
-        self.model, prop_names = self._world_cache[world_name]
+        self.model, prop_names, grasp_names = self._world_cache[world_name]
         self.data = mujoco.MjData(self.model)
         self.world_name = world_name
+
+        # 집기 시스템: 손(오른 손목 끝 링크) + 물체별 freejoint 주소
+        self.hand_bid = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, 'right_wrist_roll_link')
+        self.graspables = {}
+        self.grasp_bids = set()
+        for name in grasp_names:
+            bid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            jid = self.model.body_jntadr[bid]
+            self.graspables[name] = {
+                'bid': bid,
+                'qpos_adr': self.model.jnt_qposadr[jid],
+                'qvel_adr': self.model.jnt_dofadr[jid],
+            }
+            self.grasp_bids.add(bid)
+        self.carrying = None
 
         self.act_joint_ids = [
             self.model.actuator_trnid[i][0] for i in range(self.model.nu)]
@@ -266,8 +342,13 @@ class X2SimNode(Node):
         self.prev_base_linvel = np.zeros(3)
         self.batt_start_time = self.data.time
 
+        self.posture = 'stand'
+        self.base_z0 = float(self.data.qpos[2])
         self.prop_gids = set()
         for name in prop_names:
+            # 바닥 오버레이/러그는 로봇이 밟고 서는 면 — 차단 대상 아님
+            if '_floor' in name or name == 'rug':
+                continue
             gid = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
             if gid >= 0:
@@ -275,13 +356,18 @@ class X2SimNode(Node):
         self._contact_prev = False
         self._blocked_logged = False
 
-        if self.renderer is not None:
-            try:
-                self.renderer.close()
-            except Exception:
-                pass
+        for attr in ('renderer', 'renderer_prev'):
+            old = getattr(self, attr, None)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
         self.renderer = mujoco.Renderer(
             self.model, height=self.cam_size[1], width=self.cam_size[0])
+        # 프리뷰(라이브 영상)용 저해상도 렌더러 — 전용 스레드가 연속 렌더
+        self.renderer_prev = mujoco.Renderer(
+            self.model, height=self.prev_size[1], width=self.prev_size[0])
         self.get_logger().info(
             f'월드 로드: {world_name} — 소품 {len(prop_names)}개, '
             f'nq={self.model.nq}, nu={self.model.nu}')
@@ -292,11 +378,12 @@ class X2SimNode(Node):
             self.get_logger().warning(
                 f'미등록 월드 {name!r} — 사용 가능: {list(WORLDS)}')
             return
-        with self.render_lock:
+        with self.render_lock, self.prev_lock:
             with self.state_lock:
                 self._build_world(name)
         self.mc.reset()
         self.pub_world.publish(String(data=name))
+        self.pub_carrying.publish(String(data=''))
         # 전환 직후 즉시 1프레임 렌더·발행 — 다음 카메라 틱(2Hz)을
         # 기다리지 않아 화면 반영 지연 최소화
         try:
@@ -304,6 +391,93 @@ class X2SimNode(Node):
         except Exception as e:
             self.get_logger().warning(f'전환 직후 렌더 실패(무해): {e}')
         self.get_logger().info(f'월드 전환 완료: {name}')
+
+    # ---------- 집기/놓기 (시뮬 전용) ----------
+    GRASP_RANGE = 0.95   # 베이스 기준 도달 반경 (m)
+
+    def on_grasp(self, msg: String):
+        name = msg.data.strip()
+        info = self.graspables.get(name)
+        if info is None:
+            self.pub_grasp_result.publish(String(
+                data=f'fail:unknown:{name}'))
+            return
+        if self.carrying:
+            self.pub_grasp_result.publish(String(
+                data=f'fail:hands_full:{self.carrying}'))
+            return
+        with self.state_lock:
+            obj = self.data.xpos[info['bid']]
+            base = self.data.qpos[0:2]
+            dist = float(np.hypot(obj[0] - base[0], obj[1] - base[1]))
+            if dist > self.GRASP_RANGE:
+                self.pub_grasp_result.publish(String(
+                    data=f'fail:too_far:{name}:{dist:.2f}'))
+                self.get_logger().info(
+                    f'집기 거부: {name} 거리 {dist:.2f}m > {self.GRASP_RANGE}m')
+                return
+            self.carrying = name
+        self.pub_carrying.publish(String(data=name))
+        self.pub_grasp_result.publish(String(data=f'ok:{name}'))
+        self.get_logger().info(f'집음: {name} (거리 {dist:.2f}m)')
+
+    def on_release(self, msg: String):
+        if self.carrying:
+            self.get_logger().info(f'내려놓음: {self.carrying}')
+        self.carrying = None
+        self.pub_carrying.publish(String(data=''))
+
+    def apply_carry(self):
+        """잡은 물체를 손 위치에 키네마틱 부착 (놓으면 물리로 낙하)."""
+        if not self.carrying:
+            return
+        info = self.graspables.get(self.carrying)
+        if info is None:
+            self.carrying = None
+            return
+        hand = self.data.xpos[self.hand_bid]
+        c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
+        # 손 약간 앞/아래 지점에 물체 고정 (몸 기준 전방 오프셋)
+        adr = info['qpos_adr']
+        self.data.qpos[adr:adr + 3] = (
+            hand[0] + 0.10 * c, hand[1] + 0.10 * s, hand[2] - 0.03)
+        vadr = info['qvel_adr']
+        self.data.qvel[vadr:vadr + 6] = 0.0
+
+    def set_posture(self, posture: str):
+        """앉기/서기 자세 (McMock이 SIT_DOWN/STAND_UP 액션에서 호출)."""
+        self.posture = posture
+        self.base_xyz[2] = self.base_z0 - 0.23 if posture == 'sit' else self.base_z0
+        self.get_logger().info(f'자세 전환: {posture} (base z={self.base_xyz[2]:.2f})')
+
+    def posture_offsets(self):
+        if self.posture != 'sit':
+            return None
+        off = {}
+        for side in ('left', 'right'):
+            off[f'{side}_hip_pitch_joint'] = -1.35   # 허벅지 앞으로
+            off[f'{side}_knee_joint'] = 1.5          # 무릎 굽힘
+            off[f'{side}_ankle_pitch_joint'] = -0.15
+        return off
+
+    def carry_arm_offsets(self):
+        """물건을 들고 있는 동안 오른팔 들기 자세."""
+        if not self.carrying:
+            return None
+        return {'right_shoulder_pitch_joint': -0.9,
+                'right_elbow_joint': -0.9}
+
+    def publish_objects(self):
+        objs = {}
+        for name, info in self.graspables.items():
+            p = self.data.xpos[info['bid']]
+            objs[name] = {'x': round(float(p[0]), 2),
+                          'y': round(float(p[1]), 2),
+                          'z': round(float(p[2]), 2)}
+        payload = {'world': self.world_name, 'carrying': self.carrying,
+                   'objects': objs}
+        self.pub_objects.publish(String(
+            data=json.dumps(payload, ensure_ascii=False)))
 
     # ---------- 콜백 ----------
     def on_reset(self, req, res):
@@ -322,7 +496,9 @@ class X2SimNode(Node):
                                        1 - 2 * (qy * qy + qz * qz))
             self.prev_base_linvel = np.zeros(3)
             self.batt_start_time = self.data.time   # 배터리 만충 복원
+            self.carrying = None
         self.mc.reset()
+        self.pub_carrying.publish(String(data=''))
         self.get_logger().info('시뮬 초기화 완료 (초기 자세/위치/MC 상태)')
         res.success = True
         res.message = '시뮬 초기화 완료'
@@ -384,8 +560,18 @@ class X2SimNode(Node):
             if a_prop == b_prop:
                 continue              # 둘 다 소품이거나 둘 다 비소품
             other = b if a_prop else a
-            if self.model.geom_bodyid[other] == 0:
+            other_body = self.model.geom_bodyid[other]
+            if other_body == 0:
                 continue              # 바닥 등 worldbody geom 제외
+            if other_body in self.grasp_bids:
+                continue              # 집기 물체가 소품 위에 놓인 것 — 로봇 아님
+            self._last_contact_pair = (
+                mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                  a if a_prop else b) or '?',
+                mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                  other)
+                or mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY,
+                                     other_body) or '?')
             return True               # 상대가 로봇 바디 → 접촉
         return False
 
@@ -397,6 +583,7 @@ class X2SimNode(Node):
                 prev_yaw = self.base_yaw
                 self.apply_locomotion()
                 mujoco.mj_step(self.model, self.data)
+                self.apply_carry()
                 hit = self._robot_prop_contact()
                 # 차단 기준은 "마지막 승인 위치의 접촉 여부"다.
                 # (직전 스텝이 아니라 승인 위치 기준이어야 접촉이 지속되는
@@ -407,9 +594,10 @@ class X2SimNode(Node):
                     self.cmd_vel[:] = 0.0
                     # 승인 위치는 그대로(접촉 없음) → _contact_prev 유지
                     if not self._blocked_logged:
+                        pair = getattr(self, '_last_contact_pair', ('?', '?'))
                         self.get_logger().warning(
-                            '장애물 접촉 — 이동 차단 (베이스 롤백). '
-                            '실기라면 충돌 직전 상황')
+                            f'장애물 접촉 — 이동 차단 (베이스 롤백): '
+                            f'소품={pair[0]} ↔ 로봇측={pair[1]}')
                         self._blocked_logged = True
                 else:
                     # 이동을 승인 — 승인 위치의 접촉 상태 갱신
@@ -424,7 +612,13 @@ class X2SimNode(Node):
         q = self.data.qpos[self.act_qpos_adr]
         v = self.data.qvel[self.act_qvel_adr]
         q_target = self.q_ref
-        offs = self.motion_offsets()
+        offs = self.motion_offsets() or {}
+        carry = self.carry_arm_offsets()
+        posture = self.posture_offsets()
+        if posture:
+            offs = {**posture, **offs}
+        if carry:
+            offs = {**carry, **offs}   # 모션이 있으면 모션 우선
         if offs:
             q_target = self.q_ref.copy()
             for jname, delta in offs.items():
@@ -511,6 +705,41 @@ class X2SimNode(Node):
 
         self.cam_info.header.stamp = stamp
         self.pub_cam_info.publish(self.cam_info)
+
+    def _preview_loop(self):
+        """저해상도 프리뷰를 연속 렌더 → 라이브 영상.
+
+        핵심 트릭: 로봇 자신의 비주얼 메시(geom group 1, 약 97만 정점 =
+        렌더 비용의 ~96%)를 프리뷰에서만 제외 → 320x240 기준 18ms/frame.
+        1인칭 카메라라 자기 몸은 화면에 거의 안 잡히므로 화질 손실 없음.
+        10fps로 페이싱해 물리 틱/메인 카메라와 CPU를 나눠 쓴다."""
+        opt = mujoco.MjvOption()
+        opt.geomgroup[1] = 0        # 로봇 비주얼 메시 제외 (프리뷰 전용)
+        PERIOD = 0.1                # 10fps 상한
+        while rclpy.ok():
+            t_start = time.monotonic()
+            try:
+                with self.prev_lock:
+                    r = self.renderer_prev
+                    if r is None:
+                        time.sleep(0.1)
+                        continue
+                    with self.state_lock:
+                        r.update_scene(self.data, camera=CAMERA_NAME,
+                                       scene_option=opt)
+                    rgb = r.render()
+                buf = io.BytesIO()
+                PILImage.fromarray(rgb).save(buf, format='JPEG', quality=70)
+                msg = CompressedImage()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.header.frame_id = CAMERA_NAME
+                msg.format = 'jpeg'
+                msg.data = buf.getvalue()
+                self.pub_preview.publish(msg)
+                time.sleep(max(0.005, PERIOD - (time.monotonic() - t_start)))
+            except Exception as e:
+                self.get_logger().warning(f'프리뷰 렌더 오류(계속): {e}')
+                time.sleep(0.3)
 
     # ---------- 퍼블리시 ----------
     def stamp_header(self, header):

@@ -81,6 +81,11 @@ class Bridge(Node):
             String, '/x2_sim/world',
             lambda m: self.state.__setitem__('world', m.data), latched)
 
+        # 라이브 프리뷰(저해상 고빈도) 우선, 없으면(실기) 메인 카메라 사용
+        self._preview_seen = False
+        self.create_subscription(
+            CompressedImage, '/x2_sim/preview/compressed',
+            self.on_preview, qos_profile_sensor_data)
         self.create_subscription(
             CompressedImage,
             '/aima/hal/sensor/rgbd_head_front/rgb_image/compressed',
@@ -117,7 +122,16 @@ class Bridge(Node):
             for q in list(self.subscribers):   # 모든 연결에 브로드캐스트
                 self.loop.call_soon_threadsafe(q.put_nowait, item)
 
+    def on_preview(self, msg):
+        self._preview_seen = True
+        with self.frame_cond:
+            self.frame = bytes(msg.data)
+            self.frame_n += 1
+            self.frame_cond.notify_all()
+
     def on_frame(self, msg):
+        if self._preview_seen:      # 시뮬 프리뷰가 살아 있으면 그쪽만 사용
+            return
         with self.frame_cond:
             self.frame = bytes(msg.data)
             self.frame_n += 1

@@ -52,6 +52,10 @@ TRANSITIONS = {
     McAction.JOINT_DEFAULT: {McAction.PASSIVE_DEFAULT,
                              McAction.DAMPING_DEFAULT,
                              McAction.ZERO_TORQUE_DEFAULT},
+    # 앉기/일어서기 (실기 액션 코드 2000/2005 — 매뉴얼 3.2.4/3.3.3)
+    McAction.SIT_DOWN_DEFAULT: {McAction.STAND_DEFAULT,
+                                McAction.STAND_BODY_CONTROL},
+    McAction.STAND_UP_DEFAULT: {McAction.SIT_DOWN_DEFAULT},
 }
 
 # 알려진 프리셋 모션 ID (McPresetMotion.msg 상수 — 화이트리스트)
@@ -159,6 +163,13 @@ class McMock:
         # 비상 계열이면 이동 명령 즉시 소거
         if target in EMERGENCY:
             self.node.clear_locomotion()
+        # 앉기/일어서기: 시뮬 자세 반영. STAND_UP은 완료 후 STAND로 귀결
+        if target == McAction.SIT_DOWN_DEFAULT:
+            self.node.set_posture('sit')
+        elif target == McAction.STAND_UP_DEFAULT:
+            self.node.set_posture('stand')
+            self.current_action = int(McAction.STAND_DEFAULT)
+            self.log.info('일어서기 완료 → STAND_DEFAULT')
         return res
 
     def get_action(self, req, res):

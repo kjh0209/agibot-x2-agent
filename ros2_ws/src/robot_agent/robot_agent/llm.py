@@ -42,10 +42,18 @@ SYSTEM = """\
 
 # 몸에 대한 사실
 - 너는 팔 2개(7자유도), 다리 2개, 허리, 머리를 가진 휴머노이드다.
-- 팔은 있지만 물건을 집는 조작(그리핑)은 아직 지원되지 않는다 —
-  "팔이 없다"고 말하지 말고 "집는 기능이 아직 없다"고 정확히 말한다.
+- 작은 물체는 집고(pick_up) 내려놓을(put_down) 수 있다. 집을 수 있는
+  물체와 거리는 상태의 nearby_objects_dist_m에 있다(영문 이름 사용:
+  apple, mug 등 — 사용자가 "사과"라고 하면 apple로 매핑). 0.95m보다
+  멀면 먼저 move로 접근한다. 들고 있는 것은 holding에 표시된다.
+  한 번에 하나만 들 수 있다.
 - 고개 돌리기는 preset(POINT_HEAD/SHAKE_HEAD)에는 있지만 특정 각도로
   돌리는 기능은 아직 없다 — 대신 몸 전체를 move(wz)로 돌릴 수 있다.
+- 기본 공간은 집(home)이며 거실/주방/현관/소파/냉장고로 걸어서 이동한다
+  (go_to_place — 물건을 든 채로도 이동 가능). "소파에 앉아" 요청 흐름:
+  go_to_place('소파') → 도착하면 자동으로 소파를 등지고 서므로 →
+  sit_down. 들고/앉은 상태는 반드시 상태값(holding, mode)으로 확인하고
+  추측으로 말하지 않는다.
 - 넘어졌는지는 화면 느낌으로 추측하지 말고 반드시 get_status의
   upright 값으로 판단한다. upright=true면 서 있는 것이다. 화면이
   이상하면 대부분 장애물에 부딪혀 이동이 차단됐거나 고개가 밀린 것.
@@ -84,12 +92,16 @@ TOOLS = [
         'description': (
             '로봇을 이동시킨다. vx 전진(+)/후진(-) m/s, vy 좌(+)/우(-) m/s, '
             'wz 좌회전(+)/우회전(-) rad/s, duration 초. '
-            '상한: |vx|≤0.3, |vy|≤0.2, |wz|≤0.5, duration≤3.'),
+            '상한: |vx|≤0.3, |vy|≤0.2, |wz|≤0.5, duration≤3. '
+            'wait=true면 이동 완료까지 기다렸다 물체 거리를 돌려준다 — '
+            '접근 후 집기 같은 복합 작업에서는 반드시 wait=true로 이동하고 '
+            '같은 턴에서 다음 행동까지 이어서 한다.'),
         'input_schema': {
             'type': 'object',
             'properties': {
                 'vx': {'type': 'number'}, 'vy': {'type': 'number'},
                 'wz': {'type': 'number'}, 'duration': {'type': 'number'},
+                'wait': {'type': 'boolean'},
             },
         },
     },
@@ -126,11 +138,40 @@ TOOLS = [
         },
     },
     {
+        'name': 'sit_down',
+        'description': ('앉는다 (실기 액션 SIT_DOWN과 동일). 소파/의자에 '
+                        '앉히려면 먼저 그 근처로 move(wait=true)로 이동 후 '
+                        '호출. 앉은 동안 이동 불가.'),
+        'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
+        'name': 'stand_up',
+        'description': '앉은 상태에서 일어선다.',
+        'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
+        'name': 'pick_up',
+        'description': ('물체를 집는다. 상태의 nearby_objects_dist_m에 있는 '
+                        '영문 이름 사용. 0.95m 이내여야 하며 멀면 먼저 '
+                        'move로 접근. 한 번에 하나만.'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'object_name': {'type': 'string'}},
+            'required': ['object_name'],
+        },
+    },
+    {
+        'name': 'put_down',
+        'description': '들고 있는 물체를 그 자리에 내려놓는다.',
+        'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
         'name': 'go_to_place',
-        'description': ('다른 장소로 이동한다. 갈 수 있는 곳: 스튜디오, '
-                        '거실, 사무실, 주방. "거실로 가봐" 같은 요청에 사용. '
-                        '(시뮬에서는 씬 전환이라 즉시 도착하고 위치가 '
-                        '초기화됨. 도착 후 look으로 새 장소를 확인해 알려주면 좋다)'),
+        'description': ('장소로 이동한다. 집(home) 안의 거실/주방/현관은 '
+                        '★실제로 걸어서 간다 — 수십 초 걸리고 걷는 과정이 '
+                        '카메라에 그대로 보인다. 완료 후 결과가 반환되므로 '
+                        '같은 턴에서 후속 행동(집기/앉기/look)을 이어서 할 것. '
+                        '스튜디오/사무실은 별도 공간이라 즉시 전환된다.'),
         'input_schema': {
             'type': 'object',
             'properties': {'place': {'type': 'string'}},
