@@ -153,10 +153,11 @@ class X2SimNode(Node):
 
         # CPU(OSMesa) 렌더가 프레임당 ~0.7s라 실효 1~2fps.
         # 대화형 에이전트에는 충분. (Phase 3: look()은 필요 시 단발 렌더)
-        # 1Hz: 640 렌더(~0.5s)가 render_lock을 점유하는 비율을 절반으로
-        # 낮춰 월드 전환 콜백 굶주림(15s+ 지연 사고) 방지. look()의
-        # 신선 프레임 대기(≤1.5s)는 1Hz에서도 충족.
-        self.declare_parameter('camera_rate', 1.0)
+        # 0.2Hz 킵얼라이브만 — 고해상(640) 렌더는 ~0.5s간 llvmpipe
+        # 스레드를 독점해 주기가 짧으면 프리뷰가 매초 멈칫(라이브 영상
+        # 끊김의 원인)하고 전환 콜백도 굶는다(15s+ 지연 사고). 실제
+        # 고해상 프레임은 look()이 /x2_sim/render_hq로 온디맨드 요청.
+        self.declare_parameter('camera_rate', 0.2)
         self.declare_parameter('camera_width', 640)
         self.declare_parameter('camera_height', 480)
         self.declare_parameter('jpeg_quality', 80)
@@ -261,6 +262,11 @@ class X2SimNode(Node):
         self.cam_group = MutuallyExclusiveCallbackGroup()
         self.create_timer(1.0 / cam_rate, self.tick_camera,
                           callback_group=self.cam_group)
+        # look() 온디맨드 고해상 렌더 요청 (같은 그룹 — 렌더 직렬화)
+        self.create_subscription(
+            String, '/x2_sim/render_hq',
+            lambda m: self.tick_camera(), 1,
+            callback_group=self.cam_group)
         # ---------- 라이브 프리뷰 스트림 ----------
         # UI용 저해상도 연속 렌더 — 별도 스레드가 쉬지 않고 렌더해서
         # CPU(OSMesa)가 허용하는 최대 fps로 발행. look()용 고해상 640x480
@@ -322,6 +328,22 @@ class X2SimNode(Node):
             self.model.geom_contype[gid] = 1
             self.model.geom_conaffinity[gid] = 1
         self.carrying = None
+
+        # 팔 계열 링크 — 이동 차단 판정에서 제외. 소품 옆에서 제자리
+        # 회전할 때 팔이 카운터/아일랜드를 스치는 접촉이 회전 롤백을
+        # 반복시켜 '옆에 서면 못 도는' 교착을 만들었음 (스튜디오행
+        # 실패 사고). 베이스/다리 접촉은 계속 차단.
+        self.arm_bids = set()
+        for bid in range(self.model.nbody):
+            bname = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, bid) or ''
+            # ankle/foot 포함: 가구 옆 회전·측면 보행 시 발끝 스침도 같은
+            # 교착을 만들었음(island↔left_ankle_roll_link 실측). 가구
+            # '진입'은 몸통/골반/무릎 접촉이 계속 차단하므로 안전 유지.
+            if any(k in bname for k in
+                   ('shoulder', 'arm', 'elbow', 'wrist', 'hand',
+                    'ankle', 'foot')):
+                self.arm_bids.add(bid)
 
         self.act_joint_ids = [
             self.model.actuator_trnid[i][0] for i in range(self.model.nu)]
@@ -584,6 +606,8 @@ class X2SimNode(Node):
                 continue              # 바닥 등 worldbody geom 제외
             if other_body in self.grasp_bids:
                 continue              # 집기 물체가 소품 위에 놓인 것 — 로봇 아님
+            if other_body in self.arm_bids:
+                continue              # 팔 스침은 차단 사유 아님 (회전 교착 방지)
             self._last_contact_pair = (
                 mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM,
                                   a if a_prop else b) or '?',
@@ -734,7 +758,8 @@ class X2SimNode(Node):
         10fps로 페이싱해 물리 틱/메인 카메라와 CPU를 나눠 쓴다."""
         opt = mujoco.MjvOption()
         opt.geomgroup[1] = 0        # 로봇 비주얼 메시 제외 (프리뷰 전용)
-        PERIOD = 0.1                # 10fps 상한
+        PERIOD = 0.066              # ~15fps 상한 (고해상 렌더가 온디맨드로
+                                    # 물러난 덕에 CPU 여유 확보)
         while rclpy.ok():
             t_start = time.monotonic()
             try:

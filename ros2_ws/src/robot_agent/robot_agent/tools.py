@@ -88,6 +88,9 @@ class ToolExecutor:
         # 장소 이동(시뮬: 월드 전환) 발행자
         self.pub_set_world = node.create_publisher(
             String, '/x2_sim/set_world', 10)
+        # look() 온디맨드 고해상 렌더 요청 (시뮬 전용 — 실기는 상시 스트림)
+        self.pub_render_hq = node.create_publisher(
+            String, '/x2_sim/render_hq', 1)
         # 집기/놓기 (시뮬 전용 — 실기는 핸드 하드웨어 + HandCommand)
         self.pub_grasp = node.create_publisher(String, '/x2_sim/grasp', 10)
         self.pub_release = node.create_publisher(
@@ -170,6 +173,9 @@ class ToolExecutor:
 
     # ---------- 툴 구현 ----------
     def look(self):
+        if ROBOT_TARGET == 'sim':
+            # 고해상 렌더는 온디맨드 — 요청 후 신선 프레임 대기
+            self.pub_render_hq.publish(String(data='look'))
         frame = self.node.latest_frame()
         if frame is None:
             self.audit('look', {}, False, 'no frame')
@@ -456,7 +462,7 @@ class ToolExecutor:
                     msg.forward_velocity = 0.0
                     msg.angular_velocity = max(-0.5, min(0.5, 1.2 * err))
                 else:
-                    msg.forward_velocity = 0.25
+                    msg.forward_velocity = MAX_VX   # 보행 최고 속도
                     msg.angular_velocity = max(-0.4, min(0.4, err))
                 self.pub_vel.publish(msg)
                 time.sleep(0.1)
@@ -505,23 +511,55 @@ class ToolExecutor:
             if dist0 < 0.5:
                 self.audit('go_to_place', args, True, 'already there')
                 return {'ok': f'이미 {place} 근처에 있음'}
-            # ★허브 라우팅: 방마다 가구 없는 허브를 두고
-            #   내 방 허브 → 문 → 상대 방 허브 → (목적지별 경유점) → 목적지
-            # 순으로 걸어 가구(티테이블/아일랜드)를 우회한다.
-            hubs = home.get('hubs', {})
+            # ★방 그래프 라우팅: 현재 방 → (BFS 최단 방 경로) → 목적 방.
+            #   각 전이는 [이 방 허브] → 문 → [다음 방 허브] 순 — 허브는
+            #   가구 없는 지점이라 티테이블/아일랜드 등을 자연 우회한다.
+            rooms = home.get('rooms', {})
+            doors = home.get('doors', {})
 
-            def side(y):
-                return 'living' if y > 0.6 else (
-                    'kitchen' if y < -0.6 else None)
+            def room_of(x, y):
+                if x >= 2.0:
+                    return 'living' if y > 0 else 'kitchen'
+                if x >= -1.0:
+                    return 'hall'
+                return 'studio' if y > 0 else 'office'
 
-            s, t = side(pos[1]), side(ty)
+            def door_between(a, b):
+                return doors.get((a, b)) or doors.get((b, a))
+
+            s, t = room_of(*pos), room_of(tx, ty)
+            # BFS 최단 방 경로
+            path = [s]
+            if s != t:
+                adj = {}
+                for (a, b) in doors:
+                    adj.setdefault(a, []).append(b)
+                    adj.setdefault(b, []).append(a)
+                seen, queue = {s: None}, [s]
+                while queue:
+                    cur = queue.pop(0)
+                    if cur == t:
+                        break
+                    for nxt in adj.get(cur, []):
+                        if nxt not in seen:
+                            seen[nxt] = cur
+                            queue.append(nxt)
+                if t not in seen:
+                    msg = f'{place}까지 가는 경로를 찾을 수 없음'
+                    self.audit('go_to_place', args, False, msg)
+                    return {'error': msg}
+                path = []
+                cur = t
+                while cur is not None:
+                    path.append(cur)
+                    cur = seen[cur]
+                path.reverse()
             waypoints = []
-            if s is not None and s != t and s in hubs:
-                waypoints.append(tuple(hubs[s]))
-            if s is not None and t is not None and s != t:
-                waypoints.append(tuple(home['doorway']))
-            if t is not None and s != t and t in hubs:
-                waypoints.append(tuple(hubs[t]))
+            for i, room in enumerate(path):
+                if i > 0:
+                    waypoints.append(tuple(door_between(path[i - 1], room)))
+                if room in rooms and (i > 0 or len(path) > 1):
+                    waypoints.append(tuple(rooms[room]['hub']))
             waypoints += [tuple(v) for v in entry.get('via', [])]
             waypoints.append((tx, ty))
             # 현재 위치와 겹치거나 연속으로 겹치는 웨이포인트 정리
