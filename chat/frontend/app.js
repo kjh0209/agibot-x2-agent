@@ -10,6 +10,35 @@ const EMOJI_MAP = {
   cute: '🥰', angry: '😠', surprised: '😮', sleepy: '😴',
 };
 
+/* ---------- 로봇 음성 (브라우저 TTS — Mac 스피커로 재생) ---------- */
+let voiceOn = true;
+let koVoice = null;
+function pickVoice() {
+  const vs = speechSynthesis.getVoices();
+  koVoice = vs.find(v => v.lang.startsWith('ko') && /Yuna|유나/i.test(v.name))
+    || vs.find(v => v.lang.startsWith('ko')) || null;
+}
+if ('speechSynthesis' in window) {
+  pickVoice();
+  speechSynthesis.onvoiceschanged = pickVoice;
+}
+function robotSpeak(text) {
+  if (!voiceOn || !('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'ko-KR';
+  if (koVoice) u.voice = koVoice;
+  u.rate = 1.05;
+  u.pitch = 1.1;              // 로봇 느낌 살짝
+  speechSynthesis.cancel();   // 겹치면 최신 발화 우선
+  speechSynthesis.speak(u);
+}
+document.getElementById('btn-voice').addEventListener('click', (e) => {
+  voiceOn = !voiceOn;
+  if (!voiceOn) speechSynthesis.cancel();
+  e.target.textContent = voiceOn ? '🔊 음성 ON' : '🔇 음성 OFF';
+  e.target.classList.toggle('off', !voiceOn);
+});
+
 function addMsg(kind, text) {
   const div = document.createElement('div');
   div.className = 'msg ' + kind;
@@ -55,6 +84,7 @@ function connect() {
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.kind === 'status') { renderStatus(m.state); return; }
+    if (m.kind === 'say') robotSpeak(m.text);
     if (m.kind === 'emoji') {
       emojiOverlay.textContent = EMOJI_MAP[m.text] || '🙂';
       setTimeout(() => (emojiOverlay.textContent = ''), 5000);

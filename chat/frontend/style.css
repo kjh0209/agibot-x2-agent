@@ -26,6 +26,8 @@ body { background:#0f1115; color:#e8e8e8; font-family:'Apple SD Gothic Neo',
 #btn-stop:hover { background:#f39c12; }
 #btn-reset { background:#8e44ad; }
 #btn-reset:hover { background:#9b59b6; }
+#btn-voice { background:#16697a; }
+#btn-voice.off { background:#3a3f4a; color:#8b93a2; }
 #ctl-msg { color:#8f8; font-size:13px; }
 .hint { color:#5c6470; font-size:11.5px; }
 
