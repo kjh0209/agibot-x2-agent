@@ -24,6 +24,9 @@ RUN pip3 install --no-cache-dir \
     anthropic \
     fastapi "uvicorn[standard]" websockets pillow
 
+# 한글 입출력을 위한 UTF-8 로케일 (미설정 시 IME 깨진 바이트가 서로게이트로 유입)
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONIOENCODING=utf-8
+
 # 기본 DDS를 실기와 동일하게 CycloneDDS로
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 # 헤드리스 MuJoCo 렌더 (GUI 없는 컨테이너)

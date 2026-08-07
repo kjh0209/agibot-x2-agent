@@ -57,10 +57,16 @@ def main():
                 break
             if text.strip() in ('/q', '/quit', 'exit'):
                 break
-            if not text.strip():
+            # 터미널 IME가 깨진 바이트(서로게이트)를 넘겨도 죽지 않게 살균
+            text = text.encode('utf-8', 'ignore').decode('utf-8', 'ignore').strip()
+            if not text:
                 continue
             node.done.clear()
-            node.pub.publish(String(data=text))
+            try:
+                node.pub.publish(String(data=text))
+            except (UnicodeEncodeError, ValueError) as e:
+                print(f'{DIM}(입력 인코딩 문제로 전송 실패 — 다시 입력해주세요: {e}){RESET}')
+                continue
             # 답변 올 때까지 대기 (툴 실행 이벤트는 그 사이에 출력됨)
             if not node.done.wait(timeout=120):
                 print(f'{DIM}(응답 시간 초과 — 에이전트 노드가 떠 있는지 확인){RESET}')
