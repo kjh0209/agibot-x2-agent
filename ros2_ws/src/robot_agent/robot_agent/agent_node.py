@@ -26,7 +26,9 @@ from std_msgs.msg import String
 
 STOP_PATTERN = re.compile(r'(멈춰|멈추|정지|그만|스톱|stop)', re.IGNORECASE)
 
-from aimdk_msgs.msg import JointStateArray
+from aimdk_msgs.msg import JointStateArray, PmuState
+
+BATT_FULL_V, BATT_EMPTY_V = 54.6, 39.0
 
 from robot_agent.llm import MODEL, AgentBrain
 from robot_agent.tools import ToolExecutor
@@ -60,6 +62,10 @@ class AgentNode(Node):
         self.create_subscription(
             Odometry, '/slam/lidar_odom', self.on_odom,
             qos_profile_sensor_data)
+        self.battery_pct = None
+        self.create_subscription(
+            PmuState, '/aima/hal/pmu/state', self.on_pmu,
+            qos_profile_sensor_data)
 
         # ---------- 출력 ----------
         self.pub_reply = self.create_publisher(String, '/agent/reply', 10)
@@ -89,6 +95,14 @@ class AgentNode(Node):
         if self.odom_origin is None:
             self.odom_origin = (p.x, p.y)
 
+    def on_pmu(self, msg: PmuState):
+        frac = (msg.battery_voltage - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V)
+        self.battery_pct = round(max(0.0, min(1.0, frac)) * 100)
+
+    def notify_event(self, text: str):
+        """툴의 비동기 완료 통지 → UI 이벤트로 전달."""
+        self.pub_event.publish(String(data=f'[알림] {text}'))
+
     # ---------- ToolExecutor가 쓰는 인터페이스 ----------
     def latest_frame(self):
         return self.frames[-1] if self.frames else None
@@ -105,7 +119,7 @@ class AgentNode(Node):
             'joints': dict(self.joint_pos),
             'yaw_deg': round(yaw, 1),
             'upright': abs(roll) < 30 and abs(pitch) < 30,
-            'battery': '시뮬에는 배터리 없음 (실기: /aima/hal/pmu/state)',
+            'battery_pct': self.battery_pct,
         }
         if self.odom:
             st['position'] = {'x': round(self.odom[0], 2),

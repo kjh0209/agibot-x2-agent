@@ -14,6 +14,7 @@ services:
       - ../ros2_ws:/ws
       - ../sdk:/sdk
       - ../scripts:/scripts
+      - ../chat:/chat
     # 프로젝트 루트의 .env에서 ANTHROPIC_API_KEY 주입
     env_file:
       - ../.env

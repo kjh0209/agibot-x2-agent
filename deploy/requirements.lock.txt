@@ -1,0 +1,10 @@
+# Phase 8 배포용 의존성 고정 (arm64 컨테이너에서 pip3 freeze, 2026-08-07)
+# PC2(Orin NX, aarch64)에 그대로 설치: pip3 install -r requirements.lock.txt
+anthropic==0.120.2
+fastapi==0.141.1
+mujoco==3.11.0        # 시뮬 전용 — 실기 배포 시 제외 가능
+numpy==2.2.6
+onnxruntime==1.23.2   # RL 예제 전용 — 실기 배포 시 제외 가능
+pillow==12.3.0
+uvicorn==0.52.1
+websockets==16.1.1

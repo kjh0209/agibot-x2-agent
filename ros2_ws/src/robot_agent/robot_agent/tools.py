@@ -13,6 +13,7 @@
 import base64
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -20,6 +21,8 @@ from aimdk_msgs.msg import McAction, McInputAction, McLocomotionVelocity
 from std_msgs.msg import String
 from aimdk_msgs.srv import (
     GetMcAction,
+    PlayEmoji,
+    PlayTts,
     SetMcAction,
     SetMcInputSource,
     SetMcPresetMotion,
@@ -34,8 +37,21 @@ MAX_WZ = 0.5      # rad/s
 MAX_DURATION = 3.0  # s  (한 번의 move 상한)
 SOURCE = 'agent'
 SOURCE_PRIORITY = 50
+MIN_BATTERY_PCT = 15   # 이 미만이면 이동/모션 거절 (충전 안내)
 
 AUDIT_PATH = os.environ.get('AGENT_AUDIT_LOG', '/ws/log/tool_audit.jsonl')
+
+# sim/real 전환 (로드맵 원칙: 설정만으로 전환)
+#   sim  — speak/emoji를 UI 토픽으로 (시뮬에는 스피커/표정화면 없음)
+#   real — 실기 PlayTts/PlayEmoji 서비스 호출
+ROBOT_TARGET = os.environ.get('ROBOT_TARGET', 'sim')
+
+# 표정 문자열 → 실기 PlayEmoji emotion_id (PlayEmoji.srv 상수에서 확인)
+EMOJI_ID = {
+    'blink': 1, 'calm': 10, 'cute': 30, 'sleepy': 80, 'happy': 90,
+    'very_happy': 100, 'sad': 110, 'confused': 130, 'surprised': 140,
+    'thinking': 170, 'angry': 180, 'adore': 200, 'charging': 220,
+}
 
 STATE_SUCCESS = 1
 
@@ -56,6 +72,12 @@ class ToolExecutor:
             SetMcInputSource, '/aimdk_5Fmsgs/srv/SetMcInputSource')
         self.cli_preset = node.create_client(
             SetMcPresetMotion, '/aimdk_5Fmsgs/srv/SetMcPresetMotion')
+        # 실기 전용 서비스 (sim에서는 미사용 — Phase 6에서 검증)
+        self.cli_tts = node.create_client(
+            PlayTts, '/aimdk_5Fmsgs/srv/PlayTts')
+        self.cli_emoji = node.create_client(
+            PlayEmoji, '/aimdk_5Fmsgs/srv/PlayEmoji')
+        self._move_thread = None
         self.pub_vel = node.create_publisher(
             McLocomotionVelocity, '/aima/mc/locomotion/velocity', 10)
         self._stop_requested = False
@@ -158,6 +180,13 @@ class ToolExecutor:
         self.audit('get_status', {}, True, st)
         return st
 
+    def _battery_guard(self):
+        pct = self.node.battery_pct
+        if pct is not None and pct < MIN_BATTERY_PCT:
+            return (f'배터리 {pct}% — {MIN_BATTERY_PCT}% 미만이라 '
+                    f'움직임을 거절함. 충전이 필요함 (안전 가드)')
+        return None
+
     def move(self, vx=0.0, vy=0.0, wz=0.0, duration=1.0):
         args = {'vx': vx, 'vy': vy, 'wz': wz, 'duration': duration}
         # 하드 클램프 (LLM이 뭐라 하든 코드가 지킨다)
@@ -165,30 +194,59 @@ class ToolExecutor:
         vy = max(-MAX_VY, min(MAX_VY, float(vy)))
         wz = max(-MAX_WZ, min(MAX_WZ, float(wz)))
         duration = max(0.1, min(MAX_DURATION, float(duration)))
+        guard = self._battery_guard()
+        if guard:
+            self.audit('move', args, False, guard)
+            return {'error': guard}
         try:
             self.ensure_source()
             self.ensure_mode(int(McAction.LOCOMOTION_DEFAULT))
         except RuntimeError as e:
             self.audit('move', args, False, str(e))
             return {'error': str(e)}
-        # 재발행 루프: 유효기간 0.5s 대응, 10Hz
+
+        # 이전 이동이 진행 중이면 중단시키고 교체
+        if self._move_thread and self._move_thread.is_alive():
+            self._stop_requested = True
+            self._move_thread.join(timeout=0.5)
         self._stop_requested = False
-        msg = McLocomotionVelocity()
-        msg.source = SOURCE
-        msg.forward_velocity = vx
-        msg.lateral_velocity = vy
-        msg.angular_velocity = wz
-        t_end = time.monotonic() + duration
-        while time.monotonic() < t_end and not self._stop_requested:
+
+        # ★비동기 실행 (리뷰 B): 즉시 반환하고 완료는 이벤트로 알림.
+        #   재발행 루프(10Hz)는 백그라운드 스레드에서 계속된다.
+        def run():
+            start_pos = self.node.odom
+            msg = McLocomotionVelocity()
+            msg.source = SOURCE
+            msg.forward_velocity = vx
+            msg.lateral_velocity = vy
+            msg.angular_velocity = wz
+            t_end = time.monotonic() + duration
+            while time.monotonic() < t_end and not self._stop_requested:
+                self.pub_vel.publish(msg)
+                time.sleep(0.1)
+            msg.forward_velocity = 0.0
+            msg.lateral_velocity = 0.0
+            msg.angular_velocity = 0.0
             self.pub_vel.publish(msg)
-            time.sleep(0.1)
-        # 정지 명령으로 마무리
-        msg.forward_velocity = 0.0
-        msg.lateral_velocity = 0.0
-        msg.angular_velocity = 0.0
-        self.pub_vel.publish(msg)
-        stopped = ' (중간에 stop 요청으로 중단됨)' if self._stop_requested else ''
-        result = f'이동 완료: vx={vx} vy={vy} wz={wz} {duration}s{stopped}'
+            stopped = (' (stop으로 중단됨)' if self._stop_requested else '')
+            # 실제 이동 거리 — 명령과 크게 다르면 차단/제어권 상실 신호
+            actual = ''
+            if start_pos and self.node.odom:
+                dist = ((self.node.odom[0] - start_pos[0]) ** 2
+                        + (self.node.odom[1] - start_pos[1]) ** 2) ** 0.5
+                expect = (vx * vx + vy * vy) ** 0.5 * duration
+                actual = f', 실제 이동 {dist:.2f}m'
+                if expect > 0.05 and dist < expect * 0.3:
+                    actual += (' ← 명령보다 훨씬 적음! 장애물 차단 또는 '
+                               '제어권 상실(리모컨 개입) 가능성')
+            done = f'이동 종료: vx={vx} vy={vy} wz={wz} {duration}s{stopped}{actual}'
+            self.audit('move_done', args, True, done)
+            self.node.notify_event(done)
+
+        self._move_thread = threading.Thread(target=run, daemon=True)
+        self._move_thread.start()
+        result = (f'이동 시작함: vx={vx} vy={vy} wz={wz}, {duration}초간. '
+                  f'완료는 이벤트로 통지됨 — 사용자에게는 출발했다고만 알리면 됨')
         self.audit('move', args, True, result)
         return {'ok': result}
 
@@ -201,6 +259,10 @@ class ToolExecutor:
                    f'{sorted(name_to_id)}')
             self.audit('play_motion', args, False, msg)
             return {'error': msg}
+        guard = self._battery_guard()
+        if guard:
+            self.audit('play_motion', args, False, guard)
+            return {'error': guard}
         try:
             self.ensure_source()
             self.ensure_mode(int(McAction.STAND_DEFAULT))
@@ -219,14 +281,42 @@ class ToolExecutor:
         return {'ok': f'{motion} 동작 완료'}
 
     def speak(self, text: str):
-        # 시뮬: PlayTts 서비스가 없으므로 UI 이벤트로 대체 (Phase 4에서 표시)
+        if ROBOT_TARGET == 'real':
+            # 실기: PlayTts 서비스 (Phase 6에서 실물 검증 예정)
+            req = PlayTts.Request()
+            req.tts_req.text = text
+            try:
+                res = self._call(self.cli_tts, req, timeout=5.0)
+                ok = res.header.status.value == STATE_SUCCESS
+                self.audit('speak', {'text': text}, ok, 'real_tts')
+                return ({'ok': f'말함: {text}'} if ok
+                        else {'error': 'TTS 서비스가 거부함'})
+            except RuntimeError as e:
+                self.audit('speak', {'text': text}, False, str(e))
+                return {'error': f'TTS 실패: {e}'}
+        # 시뮬: 채팅 UI에 음성 말풍선으로 표시
         self.node.publish_say(text)
-        self.audit('speak', {'text': text}, True, 'emitted')
+        self.audit('speak', {'text': text}, True, 'sim_ui')
         return {'ok': f'말함: {text}'}
 
     def show_emoji(self, emoji: str):
+        emoji = str(emoji).lower()
+        if ROBOT_TARGET == 'real':
+            eid = EMOJI_ID.get(emoji)
+            if eid is None:
+                return {'error': f'미지원 표정 {emoji!r}. '
+                                 f'지원: {sorted(EMOJI_ID)}'}
+            req = PlayEmoji.Request()
+            req.emotion_id = eid
+            try:
+                self._call(self.cli_emoji, req, timeout=5.0)
+                self.audit('show_emoji', {'emoji': emoji}, True, 'real')
+                return {'ok': f'표정 표시: {emoji}'}
+            except RuntimeError as e:
+                self.audit('show_emoji', {'emoji': emoji}, False, str(e))
+                return {'error': f'표정 실패: {e}'}
         self.node.publish_emoji(emoji)
-        self.audit('show_emoji', {'emoji': emoji}, True, 'emitted')
+        self.audit('show_emoji', {'emoji': emoji}, True, 'sim_ui')
         return {'ok': f'표정 표시: {emoji}'}
 
     def stop(self):

@@ -28,6 +28,12 @@ SYSTEM = """\
   본 뒤 답한다. 추측으로 답하지 않는다.
 - 이동 요청은 move를 사용한다. 속도·시간 상한은 코드가 강제하므로
   요청이 과하면 상한 내에서 실행하고 그 사실을 말해준다.
+- move는 비동기다: 시작 즉시 반환되고 완료는 별도 알림으로 간다.
+  사용자에게는 "출발했어" 정도로 답하면 된다. 이동 결과가 필요한
+  후속 판단(도착 확인 등)은 다음 턴에서 상태/look으로 확인한다.
+- 배터리 30% 미만이면 대화 중 자연스럽게 충전 필요를 알리고,
+  15% 미만이면 이동/모션이 코드 레벨에서 거절된다 — 그 사실을
+  설명하고 충전을 요청한다.
 - 동작(인사, 손 흔들기 등)은 play_motion. 지원 목록에 없는 동작을
   요청받으면 솔직히 안 된다고 말하고 비슷한 지원 동작을 제안한다.
 - 도구가 error를 반환하면 그 내용을 숨기지 말고 자연스럽게 설명한다.
@@ -215,6 +221,7 @@ class AgentBrain:
             {'type': 'text', 'text': user_text},
         ]})
         final_text = ''
+        last_text = ''      # 툴콜과 같은 응답에 담긴 텍스트도 보존
         for _ in range(8):  # 툴 루프 상한
             resp = self.client.messages.create(
                 model=MODEL,
@@ -241,9 +248,13 @@ class AgentBrain:
                         'name': block.name, 'input': block.input})
             self.history.append({'role': 'assistant', 'content': content_dump})
 
+            turn_text = '\n'.join(
+                b.text for b in resp.content if b.type == 'text').strip()
+            if turn_text:
+                last_text = turn_text
+
             if resp.stop_reason != 'tool_use':
-                final_text = next(
-                    (b.text for b in resp.content if b.type == 'text'), '')
+                final_text = turn_text or last_text
                 break
 
             results = []
@@ -256,7 +267,7 @@ class AgentBrain:
             self.history.append({'role': 'user', 'content': results})
             self._strip_old_images()
         else:
-            final_text = '(툴 호출이 너무 길어져 중단했어요)'
+            final_text = last_text or '(툴 호출이 너무 길어져 중단했어요)'
 
         self._trim()
-        return final_text or '(응답 없음)'
+        return final_text or last_text or '(응답 없음)'

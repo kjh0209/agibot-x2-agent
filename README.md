@@ -11,13 +11,16 @@
 ## 저장소 구조 (예정)
 
 ```
-ros2_ws/          # ROS 2 워크스페이스 (x2_rl_deploy, 브릿지/에이전트 노드)
-  src/
-    camera_bridge/   # Phase 2: MuJoCo → sensor_msgs/Image 퍼블리셔
-    robot_agent/     # Phase 3: Claude 기반 에이전트 노드 (rclpy)
-chat/             # Phase 4: 자체 채팅 앱 (React) + FastAPI/rosbridge
-docker/           # Ubuntu 22.04 + ROS 2 Humble 개발 컨테이너
-sdk/              # AimDK SDK/URDF (downloads/는 git 제외)
+ros2_ws/src/
+  x2_sim/         # 자체 MuJoCo 시뮬 (공식 MJCF·토픽·메시지, 카메라, MC 목,
+                  #   충돌 차단, PMU 목, 리셋 서비스) + MJPEG 뷰어(:8080)
+  robot_agent/    # Claude 두뇌 (툴 실행기·안전 가드·감사 로그) + chat_cli
+chat/             # 자체 채팅 앱 — FastAPI+WS 백엔드 / 무빌드 프론트 (:8000)
+scripts/          # env_x2.sh(환경), setup_sim.sh(x86용), chaos_mc.sh(카오스)
+deploy/           # Phase 8: systemd 유닛, requirements.lock
+docs/             # 실기 준비 체크리스트/네트워크/견적 초안/데모 각본
+docker/           # Ubuntu 22.04 + ROS 2 Humble 개발 컨테이너 (arm64)
+sdk/              # AimDK SDK/URDF (downloads/·해제본은 git 제외)
 ```
 
 ## 개발 환경

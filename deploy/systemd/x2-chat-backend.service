@@ -1,0 +1,17 @@
+# Phase 8: 채팅 앱 백엔드 (PC2 통합 배치 — 별도 서버 비용 0)
+[Unit]
+Description=Agibot X2 Chat Web Backend
+After=x2-agent.service
+
+[Service]
+Type=simple
+User=agi
+WorkingDirectory=/agibot/data/home/agi/agibot_chatapp
+EnvironmentFile=/agibot/data/home/agi/agibot_chatapp/.env
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source install/setup.bash && python3 chat/backend/main.py'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

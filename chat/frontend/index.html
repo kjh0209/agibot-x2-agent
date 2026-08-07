@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agibot X2 채팅</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <section id="left">
+    <h1>🤖 Agibot X2 <span id="conn" class="badge off">연결 중…</span></h1>
+    <div id="cam-wrap">
+      <img id="cam" src="/stream" alt="로봇 시점">
+      <div id="emoji-overlay"></div>
+    </div>
+    <div id="badges">
+      <span class="badge" id="b-mode">모드: ?</span>
+      <span class="badge" id="b-upright">자세: ?</span>
+      <span class="badge" id="b-pos">위치: ?</span>
+      <span class="badge" id="b-batt">배터리: ?</span>
+    </div>
+    <div id="controls">
+      <button id="btn-stop" title="LLM·에이전트를 거치지 않는 독립 정지 경로">🛑 즉시 정지</button>
+      <button id="btn-reset">🔄 시뮬 초기화</button>
+      <span id="ctl-msg"></span>
+    </div>
+    <p class="hint">즉시 정지는 LLM 독립 경로입니다. 채팅의 "멈춰"는 두 번째 경로.</p>
+  </section>
+  <section id="right">
+    <div id="chat"></div>
+    <form id="input-row">
+      <input id="input" autocomplete="off" placeholder="메시지를 입력하세요 — 예: 지금 뭐 보여?">
+      <button type="submit">전송</button>
+    </form>
+  </section>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

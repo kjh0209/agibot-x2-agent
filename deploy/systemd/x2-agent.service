@@ -1,0 +1,23 @@
+# Phase 8: PC2(Orin NX) 온보드 배포용 systemd 유닛 — 에이전트 노드
+# 설치: sudo cp *.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#       sudo systemctl enable --now x2-agent
+# 주의: WorkingDirectory/User는 실기 $HOME(/agibot/data/home/agi) 기준.
+#       $HOME/aimdk* 아래에는 절대 두지 말 것 (시스템 예약 영역).
+[Unit]
+Description=Agibot X2 Chat Agent Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agi
+WorkingDirectory=/agibot/data/home/agi/agibot_chatapp
+EnvironmentFile=/agibot/data/home/agi/agibot_chatapp/.env
+Environment=ROBOT_TARGET=real
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source install/setup.bash && ros2 run robot_agent agent_node'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

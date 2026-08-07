@@ -27,7 +27,12 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu
 from std_srvs.srv import Trigger
 
-from aimdk_msgs.msg import JointState, JointStateArray, McLocomotionVelocity
+from aimdk_msgs.msg import (
+    JointState,
+    JointStateArray,
+    McLocomotionVelocity,
+    PmuState,
+)
 
 from x2_sim.mc_services import McMock
 
@@ -196,6 +201,16 @@ class X2SimNode(Node):
         # 위치(odometry) — 실기의 SLAM odom 토픽명 그대로
         self.pub_odom = self.create_publisher(
             Odometry, '/slam/lidar_odom', qos_profile_sensor_data)
+
+        # PMU 목 — 감쇠 배터리 (만충 54.6V → 방전한계 39V, 기본 2시간)
+        # "배터리 30% 미만 경고 / 15% 미만 세션 종료" 가드를 시뮬에서
+        # 테스트할 수 있게 함. battery_minutes 파라미터로 감쇠 속도 조절.
+        self.declare_parameter('battery_minutes', 120.0)
+        self.batt_v_full, self.batt_v_empty = 54.6, 39.0
+        self.batt_start_time = self.data.time
+        self.pub_pmu = self.create_publisher(
+            PmuState, '/aima/hal/pmu/state', qos_profile_sensor_data)
+        self.create_timer(1.0, self.publish_pmu)
         self.create_subscription(
             McLocomotionVelocity, '/aima/mc/locomotion/velocity',
             self.on_cmd_vel, 10)
@@ -259,6 +274,7 @@ class X2SimNode(Node):
             self.base_yaw = math.atan2(2 * (qw * qz + qx * qy),
                                        1 - 2 * (qy * qy + qz * qz))
             self.prev_base_linvel = np.zeros(3)
+            self.batt_start_time = self.data.time   # 배터리 만충 복원
         self.mc.reset()
         self.get_logger().info('시뮬 초기화 완료 (초기 자세/위치/MC 상태)')
         res.success = True
@@ -513,6 +529,18 @@ class X2SimNode(Node):
         od.twist.twist.linear.y = float(self.data.qvel[1])
         od.twist.twist.angular.z = float(self.data.qvel[5])
         self.pub_odom.publish(od)
+
+    def publish_pmu(self):
+        mins = float(self.get_parameter('battery_minutes').value)
+        elapsed_min = (self.data.time - self.batt_start_time) / 60.0
+        frac = max(0.0, 1.0 - elapsed_min / mins)
+        msg = PmuState()
+        msg.battery_voltage = self.batt_v_empty + frac * (
+            self.batt_v_full - self.batt_v_empty)
+        msg.battery_pack_voltage = msg.battery_voltage
+        msg.battery_current = -3.0 if self.cmd_vel.any() else -1.0
+        msg.battery_temperature = 32.0
+        self.pub_pmu.publish(msg)
 
 
 def main():
