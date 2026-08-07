@@ -41,6 +41,13 @@ class ChatCli(Node):
 
 
 def main():
+    # 터미널 IME가 조합/백스페이스 중 깨진 바이트를 흘려도 input()이
+    # 죽지 않도록 stdin/stdout을 관대한 디코딩으로 재구성 (근본 방어)
+    try:
+        sys.stdin.reconfigure(errors='replace')
+        sys.stdout.reconfigure(errors='replace')
+    except (AttributeError, ValueError):
+        pass
     rclpy.init()
     node = ChatCli()
     spin_thread = threading.Thread(
@@ -57,8 +64,9 @@ def main():
                 break
             if text.strip() in ('/q', '/quit', 'exit'):
                 break
-            # 터미널 IME가 깨진 바이트(서로게이트)를 넘겨도 죽지 않게 살균
-            text = text.encode('utf-8', 'ignore').decode('utf-8', 'ignore').strip()
+            # 살균: 서로게이트 제거 + 치환문자(�) 제거
+            text = text.encode('utf-8', 'ignore').decode('utf-8', 'ignore')
+            text = text.replace('�', '').strip()
             if not text:
                 continue
             node.done.clear()
