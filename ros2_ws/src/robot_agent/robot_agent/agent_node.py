@@ -67,6 +67,14 @@ class AgentNode(Node):
         self.create_subscription(
             PmuState, '/aima/hal/pmu/state', self.on_pmu,
             qos_profile_sensor_data)
+        # 현재 월드(장소) — latched 구독 (go_to_place 도착 확인에도 사용)
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        latched = QoSProfile(depth=1)
+        latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.current_world = None
+        self.create_subscription(
+            String, '/x2_sim/world',
+            lambda m: setattr(self, 'current_world', m.data), latched)
 
         # ---------- 출력 ----------
         self.pub_reply = self.create_publisher(String, '/agent/reply', 10)
@@ -136,6 +144,7 @@ class AgentNode(Node):
             'yaw_deg': round(yaw, 1),
             'upright': abs(roll) < 30 and abs(pitch) < 30,
             'battery_pct': self.battery_pct,
+            'place': self.current_world,
         }
         if self.odom:
             st['position'] = {'x': round(self.odom[0], 2),

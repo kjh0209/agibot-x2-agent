@@ -126,6 +126,18 @@ TOOLS = [
         },
     },
     {
+        'name': 'go_to_place',
+        'description': ('다른 장소로 이동한다. 갈 수 있는 곳: 스튜디오, '
+                        '거실, 사무실, 주방. "거실로 가봐" 같은 요청에 사용. '
+                        '(시뮬에서는 씬 전환이라 즉시 도착하고 위치가 '
+                        '초기화됨. 도착 후 look으로 새 장소를 확인해 알려주면 좋다)'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'place': {'type': 'string'}},
+            'required': ['place'],
+        },
+    },
+    {
         'name': 'stop',
         'description': '즉시 정지(속도 0). 사용자가 멈추라고 하면 최우선 호출.',
         'input_schema': {'type': 'object', 'properties': {}},

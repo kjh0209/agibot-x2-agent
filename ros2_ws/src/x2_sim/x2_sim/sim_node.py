@@ -227,8 +227,13 @@ class X2SimNode(Node):
         (초기화 시엔 스레드가 없어 락 불필요).
         """
         model_path = self.get_parameter('model_path').value
-        self.model, prop_names = load_model_with_camera_and_props(
-            model_path, world_name)
+        # 월드별 컴파일 캐시 — 재방문 시 MJCF/메시 재컴파일(~2s) 생략
+        if not hasattr(self, '_world_cache'):
+            self._world_cache = {}
+        if world_name not in self._world_cache:
+            self._world_cache[world_name] = load_model_with_camera_and_props(
+                model_path, world_name)
+        self.model, prop_names = self._world_cache[world_name]
         self.data = mujoco.MjData(self.model)
         self.world_name = world_name
 
@@ -292,6 +297,12 @@ class X2SimNode(Node):
                 self._build_world(name)
         self.mc.reset()
         self.pub_world.publish(String(data=name))
+        # 전환 직후 즉시 1프레임 렌더·발행 — 다음 카메라 틱(2Hz)을
+        # 기다리지 않아 화면 반영 지연 최소화
+        try:
+            self.tick_camera()
+        except Exception as e:
+            self.get_logger().warning(f'전환 직후 렌더 실패(무해): {e}')
         self.get_logger().info(f'월드 전환 완료: {name}')
 
     # ---------- 콜백 ----------

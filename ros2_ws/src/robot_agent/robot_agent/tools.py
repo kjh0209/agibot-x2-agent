@@ -85,6 +85,9 @@ class ToolExecutor:
         # 그룹이라 채팅 처리 중에도 즉시 실행됨
         node.create_subscription(
             String, '/agent/hard_stop', self._on_hard_stop, 10)
+        # 장소 이동(시뮬: 월드 전환) 발행자
+        self.pub_set_world = node.create_publisher(
+            String, '/x2_sim/set_world', 10)
 
     def _on_hard_stop(self, msg: String):
         self._stop_requested = True
@@ -318,6 +321,51 @@ class ToolExecutor:
         self.node.publish_emoji(emoji)
         self.audit('show_emoji', {'emoji': emoji}, True, 'sim_ui')
         return {'ok': f'표정 표시: {emoji}'}
+
+    # 장소 이름 → 시뮬 월드 매핑 (실기에서는 SLAM 내비게이션 목적지가 됨)
+    PLACES = {
+        '스튜디오': 'studio', 'studio': 'studio',
+        '거실': 'living_room', 'living_room': 'living_room',
+        '사무실': 'office', 'office': 'office',
+        '주방': 'kitchen', '부엌': 'kitchen', 'kitchen': 'kitchen',
+    }
+
+    def go_to_place(self, place: str):
+        args = {'place': place}
+        key = str(place).strip().lower()
+        world = self.PLACES.get(key) or self.PLACES.get(str(place).strip())
+        if world is None:
+            msg = f'모르는 장소 {place!r}. 갈 수 있는 곳: 스튜디오/거실/사무실/주방'
+            self.audit('go_to_place', args, False, msg)
+            return {'error': msg}
+        if ROBOT_TARGET == 'real':
+            # 실기: SLAM 내비게이션(NaviPoint)으로 구현 예정 — Phase 6+
+            msg = '실기 내비게이션은 아직 연결 전 (Phase 6+에서 SLAM 경로로 구현)'
+            self.audit('go_to_place', args, False, msg)
+            return {'error': msg}
+        if self.node.current_world == world:
+            self.audit('go_to_place', args, True, 'already there')
+            return {'ok': f'이미 {place}에 있음'}
+        # 발행 → latched 월드 토픽으로 도착 확인 (유실 대비 재시도)
+        arrived = False
+        for _ in range(3):
+            self.pub_set_world.publish(String(data=world))
+            deadline = time.monotonic() + 2.5
+            while time.monotonic() < deadline:
+                if self.node.current_world == world:
+                    arrived = True
+                    break
+                time.sleep(0.1)
+            if arrived:
+                break
+        if not arrived:
+            msg = '월드 전환 응답 없음 (시뮬 노드 상태 확인 필요)'
+            self.audit('go_to_place', args, False, msg)
+            return {'error': msg}
+        self.node.latest_frame(fresh=True, timeout=2.0)  # 새 씬 프레임 대기
+        self.audit('go_to_place', args, True, f'world={world}')
+        return {'ok': (f'{place}에 도착함 (시뮬: 씬 전환 방식이라 위치가 '
+                       f'초기화됨). look으로 새 장소를 확인해 알려줄 것')}
 
     def stop(self):
         self._stop_requested = True
