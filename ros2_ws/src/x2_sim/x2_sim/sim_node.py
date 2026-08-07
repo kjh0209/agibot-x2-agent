@@ -23,6 +23,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu
 from std_srvs.srv import Trigger
 
@@ -172,6 +173,16 @@ class X2SimNode(Node):
         self.base_yaw = math.atan2(2 * (qw * qz + qx * qy),
                                    1 - 2 * (qy * qy + qz * qz))
 
+        # 충돌 차단: 소품 geom id 수집 (키네마틱 베이스가 뚫고 지나가는
+        # 것을 막기 위해 로봇-소품 접촉 발생 시 해당 스텝 이동을 롤백)
+        self.prop_gids = set()
+        for name in ('table', 'red_box', 'blue_cup', 'yellow_ball'):
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            if gid >= 0:
+                self.prop_gids.add(gid)
+        self._contact_prev = False
+        self._blocked_logged = False
+
         # 퍼블리셔 (실기 토픽명)
         self.pub_joint = {
             g: self.create_publisher(
@@ -182,6 +193,9 @@ class X2SimNode(Node):
             name: self.create_publisher(
                 Imu, f'/aima/hal/imu/{name}/state', qos_profile_sensor_data)
             for name in ('chest', 'torso')}
+        # 위치(odometry) — 실기의 SLAM odom 토픽명 그대로
+        self.pub_odom = self.create_publisher(
+            Odometry, '/slam/lidar_odom', qos_profile_sensor_data)
         self.create_subscription(
             McLocomotionVelocity, '/aima/mc/locomotion/velocity',
             self.on_cmd_vel, 10)
@@ -258,6 +272,7 @@ class X2SimNode(Node):
         self.cmd_vel = np.array([
             msg.forward_velocity, msg.lateral_velocity, msg.angular_velocity])
         self.cmd_time = self.data.time
+        self._blocked_logged = False   # 새 명령마다 차단 로그 1회 허용
         self.get_logger().info(
             f'이동 명령 수신: vx={msg.forward_velocity:.2f} '
             f'vy={msg.lateral_velocity:.2f} wz={msg.angular_velocity:.2f} '
@@ -297,14 +312,49 @@ class X2SimNode(Node):
         return off
 
     # ---------- 메인 루프 ----------
+    def _robot_prop_contact(self) -> bool:
+        """로봇 geom과 소품 geom 사이의 접촉 존재 여부."""
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            a, b = c.geom1, c.geom2
+            a_prop, b_prop = a in self.prop_gids, b in self.prop_gids
+            if a_prop == b_prop:
+                continue              # 둘 다 소품이거나 둘 다 비소품
+            other = b if a_prop else a
+            if self.model.geom_bodyid[other] == 0:
+                continue              # 바닥 등 worldbody geom 제외
+            return True               # 상대가 로봇 바디 → 접촉
+        return False
+
     def tick(self):
         with self.state_lock:
             for _ in range(self.substeps):
                 self.apply_pd()
+                prev_xyz = self.base_xyz.copy()
+                prev_yaw = self.base_yaw
                 self.apply_locomotion()
                 mujoco.mj_step(self.model, self.data)
+                hit = self._robot_prop_contact()
+                # 차단 기준은 "마지막 승인 위치의 접촉 여부"다.
+                # (직전 스텝이 아니라 승인 위치 기준이어야 접촉이 지속되는
+                #  동안에도 계속 차단된다 — 진입-순간만 보면 뚫고 지나감)
+                if hit and not self._contact_prev:
+                    self.base_xyz[:] = prev_xyz
+                    self.base_yaw = prev_yaw
+                    self.cmd_vel[:] = 0.0
+                    # 승인 위치는 그대로(접촉 없음) → _contact_prev 유지
+                    if not self._blocked_logged:
+                        self.get_logger().warning(
+                            '장애물 접촉 — 이동 차단 (베이스 롤백). '
+                            '실기라면 충돌 직전 상황')
+                        self._blocked_logged = True
+                else:
+                    # 이동을 승인 — 승인 위치의 접촉 상태 갱신
+                    # (시작부터 접촉 상태인 경우 탈출 이동 허용)
+                    self._contact_prev = hit
         self.publish_joints()
         self.publish_imu()
+        self.publish_odom()
         self.seq += 1
 
     def apply_pd(self):
@@ -446,6 +496,23 @@ class X2SimNode(Node):
         msg.linear_acceleration.z = float(accel[2])
         for pub in self.pub_imu.values():
             pub.publish(msg)
+
+    def publish_odom(self):
+        od = Odometry()
+        od.header.stamp = self.get_clock().now().to_msg()
+        od.header.frame_id = 'odom'
+        od.child_frame_id = 'base_link'
+        od.pose.pose.position.x = float(self.data.qpos[0])
+        od.pose.pose.position.y = float(self.data.qpos[1])
+        od.pose.pose.position.z = float(self.data.qpos[2])
+        od.pose.pose.orientation.w = float(self.data.qpos[3])
+        od.pose.pose.orientation.x = float(self.data.qpos[4])
+        od.pose.pose.orientation.y = float(self.data.qpos[5])
+        od.pose.pose.orientation.z = float(self.data.qpos[6])
+        od.twist.twist.linear.x = float(self.data.qvel[0])
+        od.twist.twist.linear.y = float(self.data.qvel[1])
+        od.twist.twist.angular.z = float(self.data.qvel[5])
+        self.pub_odom.publish(od)
 
 
 def main():

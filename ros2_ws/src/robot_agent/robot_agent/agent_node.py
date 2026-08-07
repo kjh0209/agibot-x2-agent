@@ -11,15 +11,20 @@
   구독  /aima/hal/joint/*/state, /aima/hal/imu/chest/state    (상태 캐시)
 """
 import collections
+import math
+import re
 import threading
 
 import rclpy
+from nav_msgs.msg import Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Imu
 from std_msgs.msg import String
+
+STOP_PATTERN = re.compile(r'(멈춰|멈추|정지|그만|스톱|stop)', re.IGNORECASE)
 
 from aimdk_msgs.msg import JointStateArray
 
@@ -50,6 +55,11 @@ class AgentNode(Node):
                 m.orientation.w, m.orientation.x,
                 m.orientation.y, m.orientation.z)),
             qos_profile_sensor_data)
+        self.odom = None                              # (x, y)
+        self.odom_origin = None                       # 세션 시작 위치
+        self.create_subscription(
+            Odometry, '/slam/lidar_odom', self.on_odom,
+            qos_profile_sensor_data)
 
         # ---------- 출력 ----------
         self.pub_reply = self.create_publisher(String, '/agent/reply', 10)
@@ -73,20 +83,40 @@ class AgentNode(Node):
 
         self.get_logger().info(f'에이전트 준비 완료 (model={MODEL})')
 
+    def on_odom(self, msg: Odometry):
+        p = msg.pose.pose.position
+        self.odom = (p.x, p.y)
+        if self.odom_origin is None:
+            self.odom_origin = (p.x, p.y)
+
     # ---------- ToolExecutor가 쓰는 인터페이스 ----------
     def latest_frame(self):
         return self.frames[-1] if self.frames else None
 
     def status_summary(self):
         w, x, y, z = self.imu_quat
-        import math
         yaw = math.degrees(math.atan2(2 * (w * z + x * y),
                                       1 - 2 * (y * y + z * z)))
-        return {
+        # roll/pitch로 직립 여부를 데이터로 판정 (이미지 추측 방지)
+        roll = math.degrees(math.atan2(2 * (w * x + y * z),
+                                       1 - 2 * (x * x + y * y)))
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x)))))
+        st = {
             'joints': dict(self.joint_pos),
             'yaw_deg': round(yaw, 1),
+            'upright': abs(roll) < 30 and abs(pitch) < 30,
             'battery': '시뮬에는 배터리 없음 (실기: /aima/hal/pmu/state)',
         }
+        if self.odom:
+            st['position'] = {'x': round(self.odom[0], 2),
+                              'y': round(self.odom[1], 2)}
+            if self.odom_origin:
+                dx = self.odom[0] - self.odom_origin[0]
+                dy = self.odom[1] - self.odom_origin[1]
+                st['from_start'] = {
+                    'dx': round(dx, 2), 'dy': round(dy, 2),
+                    'distance_m': round(math.hypot(dx, dy), 2)}
+        return st
 
     def publish_say(self, text):
         self.pub_say.publish(String(data=text))
@@ -98,6 +128,21 @@ class AgentNode(Node):
     def on_user_msg(self, msg: String):
         text = msg.data.strip()
         if not text:
+            return
+        # ★멈춰 fast-path: LLM/락을 거치지 않고 즉시 정지 (안전 최우선)
+        if STOP_PATTERN.search(text):
+            self.executor_tools.stop()
+            self.get_logger().warning(f'fast-path 정지 실행: {text!r}')
+            self.pub_reply.publish(String(data='바로 멈췄어!'))
+            if self._busy.acquire(blocking=False):   # LLM 유휴 시 맥락 기록
+                try:
+                    self.brain.history.append(
+                        {'role': 'user', 'content': text})
+                    self.brain.history.append(
+                        {'role': 'assistant',
+                         'content': '(즉시 정지 실행 완료)'})
+                finally:
+                    self._busy.release()
             return
         if not self._busy.acquire(blocking=False):
             self.pub_reply.publish(String(
