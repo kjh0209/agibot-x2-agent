@@ -153,7 +153,10 @@ class X2SimNode(Node):
 
         # CPU(OSMesa) 렌더가 프레임당 ~0.7s라 실효 1~2fps.
         # 대화형 에이전트에는 충분. (Phase 3: look()은 필요 시 단발 렌더)
-        self.declare_parameter('camera_rate', 2.0)
+        # 1Hz: 640 렌더(~0.5s)가 render_lock을 점유하는 비율을 절반으로
+        # 낮춰 월드 전환 콜백 굶주림(15s+ 지연 사고) 방지. look()의
+        # 신선 프레임 대기(≤1.5s)는 1Hz에서도 충족.
+        self.declare_parameter('camera_rate', 1.0)
         self.declare_parameter('camera_width', 640)
         self.declare_parameter('camera_height', 480)
         self.declare_parameter('jpeg_quality', 80)
@@ -305,12 +308,19 @@ class X2SimNode(Node):
             bid = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_BODY, name)
             jid = self.model.body_jntadr[bid]
+            gid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
             self.graspables[name] = {
                 'bid': bid,
+                'gid': gid,
                 'qpos_adr': self.model.jnt_qposadr[jid],
                 'qvel_adr': self.model.jnt_dofadr[jid],
             }
             self.grasp_bids.add(bid)
+            # 모델이 월드 캐시에 공유되므로, 이전 세션에서 운반 중이던
+            # 물체의 접촉 비활성 상태가 남아있을 수 있음 — 항상 복원
+            self.model.geom_contype[gid] = 1
+            self.model.geom_conaffinity[gid] = 1
         self.carrying = None
 
         self.act_joint_ids = [
@@ -384,12 +394,7 @@ class X2SimNode(Node):
         self.mc.reset()
         self.pub_world.publish(String(data=name))
         self.pub_carrying.publish(String(data=''))
-        # 전환 직후 즉시 1프레임 렌더·발행 — 다음 카메라 틱(2Hz)을
-        # 기다리지 않아 화면 반영 지연 최소화
-        try:
-            self.tick_camera()
-        except Exception as e:
-            self.get_logger().warning(f'전환 직후 렌더 실패(무해): {e}')
+        # (즉시 렌더 특례 제거 — 프리뷰 스레드가 0.1s 내 새 씬을 발행)
         self.get_logger().info(f'월드 전환 완료: {name}')
 
     # ---------- 집기/놓기 (시뮬 전용) ----------
@@ -417,6 +422,11 @@ class X2SimNode(Node):
                     f'집기 거부: {name} 거리 {dist:.2f}m > {self.GRASP_RANGE}m')
                 return
             self.carrying = name
+            # 운반 중 물체의 물리 접촉 비활성 — 앉을 때 물체가 허벅지와
+            # 겹치며 접촉력으로 상체를 밀어 자세가 기우는 문제 방지
+            # (착석 화면 기울어짐의 원인). 놓으면 복원.
+            self.model.geom_contype[info['gid']] = 0
+            self.model.geom_conaffinity[info['gid']] = 0
         self.pub_carrying.publish(String(data=name))
         self.pub_grasp_result.publish(String(data=f'ok:{name}'))
         self.get_logger().info(f'집음: {name} (거리 {dist:.2f}m)')
@@ -424,6 +434,10 @@ class X2SimNode(Node):
     def on_release(self, msg: String):
         if self.carrying:
             self.get_logger().info(f'내려놓음: {self.carrying}')
+            info = self.graspables.get(self.carrying)
+            if info is not None:            # 접촉 복원 (다시 잡을 수 있게)
+                self.model.geom_contype[info['gid']] = 1
+                self.model.geom_conaffinity[info['gid']] = 1
         self.carrying = None
         self.pub_carrying.publish(String(data=''))
 
@@ -496,6 +510,11 @@ class X2SimNode(Node):
                                        1 - 2 * (qy * qy + qz * qz))
             self.prev_base_linvel = np.zeros(3)
             self.batt_start_time = self.data.time   # 배터리 만충 복원
+            if self.carrying:               # 운반 중이었다면 접촉 복원
+                info = self.graspables.get(self.carrying)
+                if info is not None:
+                    self.model.geom_contype[info['gid']] = 1
+                    self.model.geom_conaffinity[info['gid']] = 1
             self.carrying = None
         self.mc.reset()
         self.pub_carrying.publish(String(data=''))

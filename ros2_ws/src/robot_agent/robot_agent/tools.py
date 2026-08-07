@@ -481,10 +481,22 @@ class ToolExecutor:
             self.audit('go_to_place', args, False, msg)
             return {'error': msg}
 
-        # ★home 월드 안의 방이면 순간이동이 아니라 실제로 걸어간다
+        # ★home 월드 안의 방이면 순간이동이 아니라 실제로 걸어간다.
+        #   다른 공간(스튜디오 등)에 있어도 먼저 home으로 복귀 후 걷는다
+        #   — 모든 장소가 항상 연결되어 있게.
         from x2_sim.worlds import WORLDS
         home = WORLDS.get('home', {})
         places = home.get('places', {})
+        if world in places and self.node.current_world != 'home':
+            held = self.node.carrying
+            if not self._switch_world('home'):
+                msg = '집(home)으로 복귀 실패 (시뮬 노드 상태 확인 필요)'
+                self.audit('go_to_place', args, False, msg)
+                return {'error': msg}
+            if held:
+                self.node.notify_event(
+                    f'공간 이동으로 들고 있던 {held}은(는) 원래 자리로 '
+                    f'돌아감')
         if self.node.current_world == 'home' and world in places:
             entry = places[world]
             tx, ty = entry['pos']
@@ -547,32 +559,37 @@ class ToolExecutor:
         if self.node.current_world == world:
             self.audit('go_to_place', args, True, 'already there')
             return {'ok': f'이미 {place}에 있음'}
-        if world not in ('studio', 'office', 'living_room', 'kitchen', 'home'):
-            return {'error': f'{place}는 현재 공간({self.node.current_world})'
-                             f'에 없음 — 집(home)에서만 갈 수 있는 곳'}
-        # 발행 → latched 월드 토픽으로 도착 확인 (유실 대비 재시도)
-        arrived = False
-        for _ in range(3):
-            self.pub_set_world.publish(String(data=world))
-            deadline = time.monotonic() + 2.5
-            while time.monotonic() < deadline:
-                if self.node.current_world == world:
-                    arrived = True
-                    break
-                time.sleep(0.1)
-            if arrived:
-                break
-        if not arrived:
+        if world not in ('studio', 'office', 'home'):
+            return {'error': f'{place}는 갈 수 없는 곳 — 집 안 장소'
+                             f'(거실/주방/현관/소파/냉장고)는 걸어서, '
+                             f'별도 공간은 스튜디오/사무실만 가능'}
+        dropped = ''
+        if self.node.carrying:
+            dropped = ' ★공간 전환으로 들고 있던 물건은 원래 자리로 돌아감'
+        if not self._switch_world(world):
             msg = '월드 전환 응답 없음 (시뮬 노드 상태 확인 필요)'
             self.audit('go_to_place', args, False, msg)
             return {'error': msg}
         self.node.latest_frame(fresh=True, timeout=2.0)  # 새 씬 프레임 대기
-        dropped = ''
-        if self.node.carrying:
-            dropped = ' ★공간 전환으로 들고 있던 물건은 원래 자리로 돌아감'
         self.audit('go_to_place', args, True, f'world={world}')
         return {'ok': (f'{place}(별도 공간)으로 전환됨. 위치 초기화됨.'
                        f'{dropped} look으로 확인해 알려줄 것')}
+
+    def _switch_world(self, world: str) -> bool:
+        """월드 전환 발행 → latched 토픽으로 도착 확인.
+
+        전환 처리(비캐시 월드 컴파일 ~2s + 렌더 락 대기)를 감안해
+        시도당 6초 대기 (2.5s 대기 시절 실측 사고: 시뮬이 8~16초 뒤에
+        처리해 성공한 전환을 실패로 보고 — 렌더 락 굶주림이 원인,
+        카메라 1Hz 완화와 함께 이중 대응)."""
+        for _ in range(2):
+            self.pub_set_world.publish(String(data=world))
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if self.node.current_world == world:
+                    return True
+                time.sleep(0.1)
+        return False
 
     def sit_down(self):
         """앉기 — 실기 McAction SIT_DOWN_DEFAULT(2000)와 동일 의미론."""
