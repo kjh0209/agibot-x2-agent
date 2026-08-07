@@ -1,0 +1,322 @@
+================================================================================
+Agibot X2 메신저 에이전트 시스템 — 진행 상황 종합 정리
+작성일: 2026-08-07 / 기준 커밋: 05dbce6 (총 5커밋)
+프로젝트 위치: /Users/jensen.kvg/Desktop/agibot_chatapp
+================================================================================
+
+■ 프로젝트 한 줄 요약
+  로봇(Agibot X2 Ultra)의 1인칭 시점 영상·상태를 맥락으로 갖고, 직접 만든
+  채팅 앱에서 사람과 대화하며 툴 콜로 행동하는 에이전트 시스템.
+  MuJoCo 시뮬에서 완성 후 설정 전환만으로 실기에 연결하는 것이 목표.
+  (카카오톡 연동은 계획에서 제외 — 자체 채팅 플랫폼으로 확정)
+
+■ 현재 위치: Phase 0 완료, Phase 1 완료. 다음은 Phase 2(카메라 브릿지).
+■ 지금까지 총 지출: 0원 (API 검증 호출 ~수 원 제외)
+
+--------------------------------------------------------------------------------
+1. 사전 조사 단계에서 확정된 사실 (문서 검증)
+--------------------------------------------------------------------------------
+
+1-1. 제공된 PDF("agibot 개발자 문서.pdf", 78MB)의 정체
+  - X2 Ultra Edition Instruction Manual V1.0.0의 1~3장만 담긴 32페이지
+    이미지 캡처본 (Feishu 문서 화면). 텍스트 레이어 없음 → 전 페이지를
+    이미지 렌더링 후 병렬 판독으로 전수 조사함.
+  - SDK 관련 장(5~8장)은 이 PDF에 없음. SDK 문서는 온라인:
+    https://x2-aimdk.agibot.com (Sphinx, 실주소는 /en/latest/)
+
+1-2. 매뉴얼에서 확인된 하드웨어/운용 핵심 사실
+  - SDK 2차 개발은 X2 "Ultra" 에디션 전용. 표준 X2는 SDK 미지원(사양표 2.8).
+  - 컴퓨팅: PC1=모션제어(MCCU), PC2=개발용(Jetson Orin NX 16GB, 157TOPS,
+    스토리지 512GB, Ultra 전용), PC3=인터랙션. 베이스보드 RK3588s+RK3588.
+  - 후면 SDK 인터페이스: 기가비트 RJ45 ×2 (Orin NX·RK3588 모두 접근 가능),
+    12V/3A·48V/5A 전원 포트, miniDP. "2차 개발 포트는 하우징 분해 필요".
+  - Ultra 센서: LiDAR, RGB-D(전면), 스테레오 RGB(전면 L/R), 후면 RGB,
+    인터랙티브 RGB, 마이크 어레이, 헤드 터치 센서. 5G 모듈+SIM 슬롯.
+  - 속도: 최대 1.5m/s, 일상 권장 ≤0.8m/s, 실험실 ≤2m/s.
+  - 배터리: 421Wh, 0.5m/s 보행 약 2시간, 충전 ≤1.5h, 퀵스왑 지원.
+  - 포장 내용물: 로봇, 배터리1, 충전기1, 리모컨(PS5 DualSense)1,
+    외장 마이크(DJI Mic 수신기 연결형)1. ★갠트리 미포함 — 별도 구매 필요.
+  - 제어 우선순위: 리모컨 > 앱 > 음성. 제어 소스 잦은 전환 금지(전도 위험).
+  - 비상정지 = zero-torque = 로봇이 그 자리에서 무너짐. 보호 프레임 권장.
+  - OTA 업그레이드 조건: 배터리 >50%, zero-torque 상태, 업그레이드 중
+    모션 명령 금지.
+  - 내장 인터랙션: 웨이크워드 "Lingxi Lingxi"(中) / "hello lumi"(英),
+    LinkSoul 플랫폼 기반 표정/TTS/얼굴인식/페르소나 커스터마이징.
+  - 안전: 작업 반경 1m 확보, 관측자 50cm 이상 거리.
+
+1-3. SDK 문서/패키지에서 확인된 개발 핵심 사실
+  - 요구 환경: Ubuntu 22.04 LTS + ROS 2 Humble + rmw_cyclonedds_cpp,
+    Python 3.8+, C++17.
+  - ★PC1(10.0.1.40)에서 빌드/실행 금지(공식 명문). 개발은 PC2(10.0.1.41).
+    유선 개발 시 호스트 PC 고정 IP 10.0.1.2/24. WiFi는 ssh 디버깅용
+    (점프호스트 192.168.88.88).
+  - ★펌웨어 업/다운그레이드 시 로봇 디스크 리포맷(SDK README 원문).
+    $HOME(/agibot/data/home/agi)만 보존, $HOME/aimdk*는 시스템 예약.
+    v1.0 펌웨어 플래싱 시 $HOME 전체가 .old_agi_home.bak으로 이동됨.
+  - 주요 인터페이스(전체 목록: sdk/aimdk-1.0.0/topics_and_services):
+      카메라  /aima/hal/sensor/rgbd_head_front/rgb_image[/compressed]
+              /aima/hal/sensor/stereo_head_front_{left,right}/rgb_image
+              /aima/hal/sensor/rgb_head_rear/rgb_image
+      상태    /aima/hal/joint/{arm,leg,waist,head,hand}/state (실기 1000Hz)
+              /aima/hal/imu/{chest,torso}/state (실기 500Hz)
+              /aima/hal/pmu/state (배터리)
+      이동    /aima/mc/locomotion/velocity (aimdk_msgs/McLocomotionVelocity:
+              forward/lateral/angular_velocity + source 문자열)
+      행동    SetMcAction / GetMcAction / SetMcPresetMotion /
+              SetMcInputSource / GetCurrentInputSource (서비스)
+      발화 등 PlayTts / PlayEmoji / PlayAudioFile / PlayVideo / SetVolume
+      오디오  /aima/hal/audio/capture (마이크 스트림 → Phase 8 STT용)
+  - 내장 인터랙션 비활성화 절차는 문서 8장 "Temporary Solutions"
+    (faq/temp_works.html#agent-only-voice). ※로드맵 초안의 "FAQ 8.1"은
+    오기여서 수정 완료.
+  - onnxruntime v1.23.2(x64)를 /usr/local에 수동 설치해야 RL 예제 빌드 가능.
+
+1-4. 구매 정보 (스토어 조사)
+  - X2 표준형 $24,240 (store.agibot.com 공식가). A2 Lite $44,560.
+  - X2 Ultra / A2 Ultra는 가격 비공개(견적 문의). 배송 $500~3,000.
+  - Ultra 추정 4,000만~6,000만원대 + 부가세10% + 관세0~8%. 리드타임
+    수주~수개월 가능 → 시뮬 개발 중에 견적을 미리 걸어둘 것(아직 안 함).
+
+--------------------------------------------------------------------------------
+2. 작성/수정된 계획 문서
+--------------------------------------------------------------------------------
+
+2-1. agibot_x2_메신저_시스템_로드맵.md (Phase 0~8)
+  주요 수정 이력:
+  - 카카오톡 연동 제거 → 자체 채팅 앱(React 웹 + 선택 PWA)으로 변경.
+    외부 접속은 Tailscale(무료), 공인 엔드포인트 불필요.
+  - Phase 3 안전가드에 추가: stop()은 "속도 0 + 모드 유지"로 구현,
+    zero-torque는 에이전트 툴에서 제외(사람 리모컨 전용).
+  - Phase 7에 추가: 내장 인터랙션 비활성화 결정을 비모션 출력 단계로
+    앞당김 + 커스텀 입력 소스 등록 시 우선순위(리모컨>앱>음성) 확인.
+  - Phase 5에 추가: Ultra는 견적 품목, 리드타임 대비 조기 견적 요청.
+  - Phase 8: 채팅 서버는 PC2 통합 권장(비용 0), "FAQ 8.1"→"8장
+    Temporary Solutions" 정정.
+  - Phase 1에 실행 기록 추가(공식 시뮬 불가 → 자체 시뮬 대체, 아래 4-3).
+
+2-2. agibot_x2_단계별_비용_정리.txt (v2)
+  - 실기 전 선지출: Anthropic API 크레딧 3만원이 전부(자동충전 OFF,
+    소진 시 5만원 단위 수동 충전). 시뮬 데모까지 총 5만~15만원 목표.
+  - 절약 원칙: 개발 루프는 Haiku(턴당 ~5원), 데모는 Sonnet(15~30원),
+    프롬프트 캐싱 필수, 이벤트 기반 호출(폴링 금지), 이미지 1장/턴.
+  - 실기 준비금(견적 도착 시점까지 확보): 본체+배송+세금 4,300만~6,500만
+    + 갠트리 80만~300만 + 안전장비 10만~50만 + 수리 예비비 200만~500만
+    = 약 4,600만~7,400만원.
+
+--------------------------------------------------------------------------------
+3. Phase 0 — 개발 환경 구축 (완료)
+--------------------------------------------------------------------------------
+
+3-1. Git 저장소
+  - agibot_chatapp에 독립 레포 생성(main). .gitignore: .env, *.pdf,
+    sdk/downloads/, sdk/aimdk-*/, build/install/log, core 덤프 등 제외.
+  - ※발견된 문제: 홈 디렉토리(/Users/jensen.kvg)에 커밋 0개짜리 git
+    저장소가 잘못 초기화되어 있음. 미처리 상태 — `rm -rf ~/.git` 권장
+    (프로젝트 레포와 무관, 사용자 결정 대기).
+
+3-2. SDK/URDF 확보 (전부 무료)
+  - 다운로드 방법 발견 과정: 문서 사이트의 플로팅 패널 스크립트
+    (/lang-ver-nav.js)가 /sdk-downloads.json 매니페스트를 읽는 것을 확인.
+    v1.0.0 / v0.9.0 / v0.8.2 / v0.8.1 링크 확보.
+  - AimDK SDK v1.0.0 (aimdk v1.0.0-ga424add):
+      sdk/downloads/aimdk-aarch64-a424add7-artifacts.zip (157MB)
+      → sdk/aimdk-1.0.0/ 에 해제(문서 제외). 구조:
+        src/aimdk_msgs   메시지/서비스 정의 + ★aarch64 프리빌트 포함
+        src/examples     C++ 예제 (locomotion, MC 제어, TTS 등)
+        src/py_examples  Python 예제 (rclpy — Phase 3 참고 코드)
+        extra/x2_rl_deploy               RL 배포 예제
+        extra/.../x2_rl_deploy_mujoco    공식 MuJoCo 시뮬 (bin/start_sim.sh)
+        topics_and_services              전체 인터페이스 목록
+  - X2 URDF v1.3.0: sdk/downloads/X2_URDF-v1.3.0.zip (48MB, 메시 STL 포함)
+  - 상세 기록: sdk/NOTES.md
+
+3-3. 컨테이너 개발 환경 (Mac은 Apple Silicon이라 ROS 2 네이티브 불가)
+  - 설치(사용자가 터미널에서 직접): Homebrew → colima + docker CLI +
+    docker-compose (+ 이후 docker-buildx 추가). 전부 무료.
+  - VM: colima --cpu 4 --memory 8 --vm-type vz --vz-rosetta
+  - docker/Dockerfile: ros:humble-ros-base-jammy 베이스 +
+    rmw-cyclonedds-cpp, cv-bridge, image-transport, colcon,
+    pip(mujoco, onnxruntime, anthropic, fastapi, uvicorn, websockets,
+    pillow), OSMesa(헤드리스 렌더), RMW=cyclonedds, MUJOCO_GL=osmesa.
+  - docker/docker-compose.yml: 서비스명 dev, 컨테이너명 agibot-dev.
+    마운트: ../ros2_ws→/ws, ../sdk→/sdk, ../scripts→/scripts.
+    포트: 8000(FastAPI), 8080(MJPEG), 9090(rosbridge).
+    ANTHROPIC_API_KEY는 호스트 .env에서 주입.
+  - 아키텍처 변천(중요):
+    ① 최초 arm64 빌드 → ② 공식 시뮬이 x86-64 전용임을 발견하고
+    platform: linux/amd64 + Rosetta로 전환(buildx 설치 필요했음)
+    → ③ 공식 시뮬이 결국 실행 불가 판명(아래 4-2)되어 arm64로 복귀.
+    현재 이미지: agibot-x2-dev:humble-arm64 (platform: linux/arm64).
+  - 검증: 컨테이너에서 ros2 doctor "All 5 checks passed",
+    mujoco 3.11.0 / onnxruntime / anthropic import 정상.
+
+3-4. Anthropic API 키
+  - .env에 사용자가 직접 입력(git 제외됨, .env.example 템플릿 제공).
+  - scripts/check_api_key.py로 검증: claude-haiku-4-5 최소 호출,
+    응답 "OK", 토큰 입력14/출력4 — 정상 동작 확인.
+
+3-5. Phase 0 완료 기준 대조
+  - [통과] ros2 doctor 정상 (컨테이너 내)
+  - [통과] SDK 압축 해제 완료
+  - [통과] URDF 확보, API 키 발급·검증, Git 레포 운영
+  - [대체] Ubuntu 22.04 PC → Docker 컨테이너(시뮬 구간 전용).
+    실기 연결(Phase 5~)에는 네이티브 Ubuntu PC 권장 유지.
+
+--------------------------------------------------------------------------------
+4. Phase 1 — 시뮬 구동 (완료, 단 공식 시뮬 → 자체 시뮬로 대체)
+--------------------------------------------------------------------------------
+
+4-1. 공식 시뮬(aima-sim-app) 실행 시도 전 과정 (시행착오 기록)
+  시도 환경: amd64 컨테이너 + Rosetta (colima vz-rosetta)
+  ① Rosetta 자체는 정상 (alpine amd64에서 uname=x86_64 확인)
+  ② x2_rl_deploy colcon 빌드 성공 (aimdk_msgs + controller, 1분41초)
+  ③ 실행 시도 → libgflags.so.2.2 없음 → libgflags2.2/libyaml-cpp0.7 설치
+  ④ → librmw_implementation.so 없음 → ROS 환경 소싱으로 해결
+  ⑤ → libaimdk_msgs__*.so 없음 → 빌드 산출물 소싱으로 해결
+  ⑥ → start_sim.sh가 "이미 실행 중" 오탐 종료: 스크립트의 pgrep -f가
+     우리 bash -c 래퍼 명령줄의 'start_sim.sh' 문자열에 걸림.
+     → 스크립트 우회, 환경변수 직접 세팅해 바이너리 직접 실행으로 전환
+     (EM_APP_NAME=sim, AGIBOT_ENABLE_* 플래그, SIM_ROBOT_PATH 등)
+  ⑦ → /sdk(virtiofs 마운트)에 default.yaml.dump 쓰기 실패(Permission
+     denied) → 트리 전체를 컨테이너 내부 /opt/x2로 복사해 해결
+  ⑧ → ★Illegal instruction in libmujoco.so.3.3.7 (mjp_pluginCount):
+     MuJoCo x86 빌드는 AVX 필수인데 Rosetta는 AVX 미지원.
+     → 대응: MuJoCo 3.3.7을 소스에서 -DMUJOCO_ENABLE_AVX=OFF로 재빌드
+     (github.com/google-deepmind/mujoco, 컨테이너 내 빌드 성공)하여
+     번들 라이브러리 교체 → 이 지점은 통과됨
+  ⑨ → Illegal instruction in mujoco_plugin/libsensor_ray.so (클로즈드
+     소스 LiDAR 플러그인, AVX 포함) → 모델 XML이 플러그인을 참조하지
+     않음을 확인하고 플러그인 디렉토리 제거로 우회
+  ⑩ → ★Illegal instruction in libaima-sim-module-mujoco.so (벤더
+     클로즈드소스 시뮬 모듈 자체에 AVX) → 재빌드 불가. 최종 결론:
+     "공식 시뮬은 Apple Silicon에서 실행 불가."
+  잔여물: /opt/x2(컨테이너 내 복사본, AVX-free libmujoco 교체+플러그인
+  비활성 상태), /opt/mujoco-src(재빌드 소스). 현 arm64 컨테이너로
+  재생성되면서 소멸 — 공식 시뮬은 추후 x86 Ubuntu PC에서 원본 그대로 사용.
+
+4-2. 대체 결정
+  - 무료 원칙 유지를 위해 x86 클라우드 VM(월 수천 원) 대신 자체 시뮬 선택.
+  - 근거: 로드맵 핵심 원칙이 "에이전트는 토픽/서비스만 바라본다"이므로,
+    공식 MJCF + 공식 메시지 타입 + 공식 토픽명만 지키면 무수정 이식 유지.
+  - 손실: 공식 RL 보행 데모(로드맵상 선택 항목)뿐.
+
+4-3. 자체 시뮬 노드 x2_sim (ros2_ws/src/x2_sim) — 구현 상세
+  - 모델: 공식 MJCF 그대로 로드
+    /sdk/aimdk-1.0.0/extra/x2_rl_deploy/x2_rl_deploy_mujoco/
+    configuration/robot/lx2501_3_t2d5/model_info/scene.xml
+    (x2.xml 포함, nq=38, 액추에이터 31개, timestep 1ms, 메시 STL 사용,
+    초기 자세: 직립, 베이스 높이 z=0.68)
+  - 메시지: ★SDK의 aarch64 프리빌트 aimdk_msgs 직접 사용(빌드 불필요)
+    — AMENT_PREFIX_PATH/LD_LIBRARY_PATH/PYTHONPATH에
+    /sdk/aimdk-1.0.0/src/aimdk_msgs/prebuilt_aarch64 추가로 해결.
+    실기와 동일 타입 보장. (scripts/env_x2.sh가 일괄 소싱)
+  - 퍼블리시(실기 동일 토픽명):
+      /aima/hal/joint/{arm,leg,waist,head}/state  aimdk_msgs/JointStateArray
+        (그룹핑: shoulder|elbow|wrist→arm 14, hip|knee|ankle→leg 12,
+         waist→3, head→2 / MessageHeader에 stamp·meas_stamp·sequence 기입)
+      /aima/hal/imu/{chest,torso}/state           sensor_msgs/Imu
+        (베이스 쿼터니언, 각속도, 유한차분 가속도+중력)
+  - 구독: /aima/mc/locomotion/velocity (aimdk_msgs/McLocomotionVelocity)
+  - 제어 방식:
+      관절 = PD 홀드(kp=120, kd=4, 초기 자세 목표, ctrlrange 클램프)
+      베이스 = hold_base 모드(기본 ON): 보행 컨트롤러가 없어 물리
+      균형이 불가능하므로 베이스 pose를 매 스텝 고정. 이동 명령은
+      목표 (x, y, yaw)를 적분해 옮기는 키네마틱 방식. 명령 유효기간
+      0.5초(갱신 없으면 정지). qvel에 명령 속도를 남겨 IMU에 반영.
+  - 페이싱: 100Hz 타이머 × 10 서브스텝 = 실시간 1kHz 물리.
+  - 파라미터: model_path, publish_rate, kp, kd, hold_base.
+  - 디버깅 기록: ①IMU가 pitch 85°로 나옴 → 구버전 코드가 실행된
+    것(빌드 미반영) + 로봇이 실제로 넘어져 있었음. ②pkill -f가 자기
+    자신을 죽이는 문제(exit 143) → "[s]im_node$" 패턴으로 해결.
+    클린 재빌드 후 직립(쿼터니언 identity) 확인.
+
+4-4. Phase 1 검증 결과 (완료 기준 통과)
+  - ros2 topic list: /aima/hal/joint/{arm,head,leg,waist}/state,
+    /aima/hal/imu/{chest,torso}/state, /aima/mc/locomotion/velocity 존재
+  - ros2 topic hz: arm/state 96.8Hz, leg/state ~100Hz (목표 100Hz)
+  - ros2 topic echo --once: JointStateArray에 left_shoulder_pitch_joint
+    등 실명 관절 + 유효 수치, IMU orientation = identity(직립)
+  - 이동 명령 e2e: ros2 topic pub으로 McLocomotionVelocity
+    (source='agent', vx=0.3) 발행 → 노드 수신 로그 + 위치 적분 확인
+
+--------------------------------------------------------------------------------
+5. 현재 저장소 상태
+--------------------------------------------------------------------------------
+
+5-1. 파일 트리 (git 관리 대상 중심)
+  README.md                          프로젝트 개요/구조/환경/비밀키 규칙
+  agibot_x2_메신저_시스템_로드맵.md   Phase 0~8 계획 (수정 반영본)
+  agibot_x2_단계별_비용_정리.txt      비용 계획 v2
+  진행상황_정리.txt                   (이 문서)
+  .gitignore / .env.example          (.env는 git 제외, 키 보관 중)
+  docker/Dockerfile                  ROS 2 Humble + 의존성 이미지 정의
+  docker/docker-compose.yml          agibot-dev 컨테이너 (arm64)
+  docker/README.md                   설치/사용/주의(공식 시뮬 불가 이력)
+  scripts/check_api_key.py           API 키 검증(하이쿠 최소 호출)
+  scripts/env_x2.sh                  ROS+aimdk_msgs 프리빌트+ws 일괄 소싱
+  scripts/setup_sim.sh               (참고용) RL deploy 빌드 스크립트
+                                     — amd64 시절 산물, x86 PC에서 재사용 가능
+  ros2_ws/src/x2_sim/                자체 시뮬 패키지 (ament_python)
+    package.xml / setup.py / setup.cfg / resource/x2_sim
+    x2_sim/sim_node.py               시뮬 노드 본체 (4-3 참조)
+  sdk/NOTES.md                       SDK 확보 기록/구조/핵심 확인사항
+  sdk/downloads/*.zip                SDK·URDF 원본 (git 제외)
+  sdk/aimdk-1.0.0/                   해제본 (git 제외)
+  chat/                              (빈 디렉토리 — Phase 4에서 사용)
+  "agibot 개발자 문서.pdf"           원본 매뉴얼 캡처 (git 제외)
+
+5-2. 커밋 이력 (오래된 것부터)
+  40d806d Phase 0: 프로젝트 초기화 — 로드맵/비용계획/Docker 개발환경 정의
+  1ba9657 Phase 0: AimDK v1.0.0 + URDF v1.3.0 확보, amd64 시뮬 대응,
+          API 키 검증 스크립트
+  7788fbd Phase 0 완료: amd64 컨테이너 ros2 doctor 통과, 시뮬 셋업
+          스크립트 추가
+  0e84360 코어덤프 제거 및 ignore 처리
+  05dbce6 Phase 1 완료: 자체 arm64 MuJoCo 시뮬 노드(x2_sim)
+
+5-3. 실행 중인 것 (휘발 — 재부팅 시 아래 "재기동 절차" 참조)
+  - colima VM (vz + rosetta), 컨테이너 agibot-dev (arm64)
+  - 컨테이너 안에서 x2_sim sim_node가 백그라운드 구동 중일 수 있음
+    (로그: 컨테이너 내 /tmp/x2sim.log)
+
+5-4. 재기동 절차 (Mac 재부팅/컨테이너 재생성 후)
+  $ colima start --cpu 4 --memory 8 --vm-type vz --vz-rosetta
+  $ cd ~/Desktop/agibot_chatapp/docker && docker compose up -d
+  $ docker exec -it agibot-dev bash
+  (컨테이너 안)
+  $ source /scripts/env_x2.sh
+  $ cd /ws && colcon build --packages-select x2_sim   # 최초 1회
+  $ ros2 run x2_sim sim_node                          # 시뮬 시작
+  (검증)
+  $ ros2 topic hz /aima/hal/joint/arm/state           # ~100Hz면 정상
+
+--------------------------------------------------------------------------------
+6. 열려 있는 이슈 / 결정 대기
+--------------------------------------------------------------------------------
+  [이슈1] 홈 디렉토리의 잘못된 git 저장소(~/.git, 커밋 0개) 정리 여부
+          — 사용자 확인 대기 (권장: 제거)
+  [이슈2] X2 Ultra 견적 요청 — 아직 안 함. 리드타임(수주~수개월) 고려 시
+          시뮬 개발과 병행해 조기 요청 권장 (비용 0원)
+  [이슈3] 공식 RL 보행 예제는 Mac에서 영구 불가 — 실기 직전 x86 Ubuntu
+          PC 마련 시점에 공식 시뮬로 최종 리허설 (setup_sim.sh 재사용)
+  [메모]  실기의 joint/state는 1000Hz, IMU 500Hz — 자체 시뮬은 100Hz.
+          에이전트는 최신값 캐시만 쓰므로 개발엔 무영향이나, 실기 전환 시
+          구독측 QoS/부하만 점검할 것.
+  [메모]  hand(그리퍼/덱스터러스 핸드) 토픽·PMU 토픽은 자체 시뮬에 아직
+          없음 — Phase 3에서 배터리 상태 배지가 필요해지면 PmuState
+          퍼블리셔 추가 예정.
+
+--------------------------------------------------------------------------------
+7. 다음 단계: Phase 2 — 카메라 브릿지 ("로봇이 보는 화면")
+--------------------------------------------------------------------------------
+  계획 (로드맵 기준 2~3일):
+  1) x2_sim에 offscreen 렌더 카메라 추가 (OSMesa, GUI 불필요)
+     - MJCF에 head 카메라가 정의돼 있는지 확인, 없으면 URDF의 카메라
+       프레임 위치(rgbd_head_front)에 가상 카메라 부착
+     - 실기 토픽명 그대로: /aima/hal/sensor/rgbd_head_front/rgb_image
+       (+ /compressed, camera_info), 10~15Hz
+  2) 씬에 테스트 오브젝트(박스/컵 등) 배치 — "앞에 뭐 보여?" 검증용
+  3) web_video_server 또는 자체 MJPEG 스트리머로 브라우저 확인
+     (컨테이너 8080 포트 → Mac 브라우저 http://localhost:8080)
+  완료 기준: 브라우저에서 로봇 1인칭 시점 영상이 실시간으로 보인다.
+================================================================================
