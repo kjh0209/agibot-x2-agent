@@ -14,10 +14,12 @@ services:
       - ../ros2_ws:/ws
       - ../sdk:/sdk
       - ../scripts:/scripts
+    # 프로젝트 루트의 .env에서 ANTHROPIC_API_KEY 주입
+    env_file:
+      - ../.env
     environment:
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - MUJOCO_GL=osmesa
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     # Phase 4 채팅 앱/영상 스트림 포트 (호스트 브라우저에서 접속)
     ports:
       - "8000:8000"   # FastAPI (채팅 백엔드)

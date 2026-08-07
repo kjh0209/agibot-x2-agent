@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>robot_agent</name>
+  <version>0.1.0</version>
+  <description>
+    Agibot X2 대화 에이전트(두뇌). 로봇 시야·상태를 맥락으로 Claude와
+    대화하고 툴 콜로 행동한다. 시뮬/실기 모두 동일 토픽·서비스 사용.
+  </description>
+  <maintainer email="cupid26code@gmail.com">jensen.kvg</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>aimdk_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
