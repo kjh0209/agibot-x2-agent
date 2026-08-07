@@ -372,6 +372,7 @@ class X2SimNode(Node):
         self.q_ref = np.array(
             [self.data.qpos[a] for a in self.act_qpos_adr])
         self.cmd_vel = np.zeros(3)
+        self.vel_smooth = np.zeros(3)   # 가감속 램프 적용된 실효 속도
         self.cmd_time = 0.0
         self.motion = None
         self.base_xyz = np.array(self.data.qpos[0:3])
@@ -547,6 +548,7 @@ class X2SimNode(Node):
             self.q_ref = np.array(
                 [self.data.qpos[a] for a in self.act_qpos_adr])
             self.cmd_vel = np.zeros(3)
+            self.vel_smooth = np.zeros(3)
             self.cmd_time = 0.0
             self.motion = None
             self.base_xyz = np.array(self.data.qpos[0:3])
@@ -706,29 +708,43 @@ class X2SimNode(Node):
         결과가 실기와 동일하므로 Phase 2~4 개발에 충분하다.
         """
         dt = self.model.opt.timestep
-        active = (self.data.time - self.cmd_time <= 0.5) and self.cmd_vel.any()
-        if active:
+        fresh = self.data.time - self.cmd_time <= 0.5
+        target = self.cmd_vel if fresh else np.zeros(3)
+        # 가감속 램프(τ=0.25s) — 명령 속도를 즉시 적용하면 방향 전환마다
+        # 카메라가 덜컹거림. 단 ★정지 명령(전부 0)은 즉시 반영 —
+        # 정지의 즉시성(안전 이중 경로)은 부드러움보다 우선.
+        if not target.any():
+            self.vel_smooth[:] = 0.0
+        else:
+            self.vel_smooth += (target - self.vel_smooth) * min(1.0, dt / 0.25)
+        if self.vel_smooth.any():
             c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
-            self.base_xyz[0] += (c * self.cmd_vel[0] - s * self.cmd_vel[1]) * dt
-            self.base_xyz[1] += (s * self.cmd_vel[0] + c * self.cmd_vel[1]) * dt
-            self.base_yaw += self.cmd_vel[2] * dt
+            self.base_xyz[0] += (c * self.vel_smooth[0]
+                                 - s * self.vel_smooth[1]) * dt
+            self.base_xyz[1] += (s * self.vel_smooth[0]
+                                 + c * self.vel_smooth[1]) * dt
+            self.base_yaw += self.vel_smooth[2] * dt
 
+        moving = bool(self.vel_smooth.any())
         if self.hold_base:
             self.data.qpos[0:3] = self.base_xyz
             half = self.base_yaw / 2.0
             self.data.qpos[3:7] = (math.cos(half), 0.0, 0.0, math.sin(half))
             self.data.qvel[0:6] = 0.0
-            if active:
+            if moving:
                 # IMU 각속도/가속에 명령이 반영되게 수평 속도만 남긴다
+                # (램프 적용된 실효 속도 기준 — IMU도 부드럽게)
                 c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
-                self.data.qvel[0] = c * self.cmd_vel[0] - s * self.cmd_vel[1]
-                self.data.qvel[1] = s * self.cmd_vel[0] + c * self.cmd_vel[1]
-                self.data.qvel[5] = self.cmd_vel[2]
-        elif active:
+                self.data.qvel[0] = (c * self.vel_smooth[0]
+                                     - s * self.vel_smooth[1])
+                self.data.qvel[1] = (s * self.vel_smooth[0]
+                                     + c * self.vel_smooth[1])
+                self.data.qvel[5] = self.vel_smooth[2]
+        elif moving:
             c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
-            self.data.qvel[0] = c * self.cmd_vel[0] - s * self.cmd_vel[1]
-            self.data.qvel[1] = s * self.cmd_vel[0] + c * self.cmd_vel[1]
-            self.data.qvel[5] = self.cmd_vel[2]
+            self.data.qvel[0] = c * self.vel_smooth[0] - s * self.vel_smooth[1]
+            self.data.qvel[1] = s * self.vel_smooth[0] + c * self.vel_smooth[1]
+            self.data.qvel[5] = self.vel_smooth[2]
 
     # ---------- 카메라 ----------
     def make_camera_info(self, w, h, fovy_deg):

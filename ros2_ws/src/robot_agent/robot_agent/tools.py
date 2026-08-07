@@ -421,6 +421,7 @@ class ToolExecutor:
             # 중간 웨이포인트는 느슨하게 통과(0.5m), 최종 목적지만 정밀(0.35m)
             radius = 0.35 if i == n_wp - 1 else 0.5
             retried = False
+            best_err = None
             while True:
                 if self._stop_requested:
                     return False, 'stop 요청으로 중단'
@@ -433,9 +434,14 @@ class ToolExecutor:
                 dist = m.hypot(dx, dy)
                 if dist < radius:
                     break
-                # 진행 감시: 5초간 거리 개선 없으면 막힌 것
+                # 진행 감시: 5초간 거리·방향 모두 개선 없으면 막힌 것
+                # (회전 중엔 거리가 안 줄므로 방향 오차 감소도 진행으로 인정)
+                _b = m.atan2(dy, dx)
+                _e = abs((_b - self.node.yaw_rad() + m.pi) % (2 * m.pi) - m.pi)
                 if best is None or dist < best - 0.05:
                     best, best_t = dist, time.monotonic()
+                elif best_err is None or _e < best_err - 0.05:
+                    best_err, best_t = _e, time.monotonic()
                 elif time.monotonic() - best_t > 5.0:
                     if not retried:
                         # 언스턱: 1.5초 후진 후 같은 웨이포인트 1회 재시도
@@ -450,6 +456,7 @@ class ToolExecutor:
                         msg.forward_velocity = 0.0
                         self.pub_vel.publish(msg)
                         best, best_t = None, time.monotonic()
+                        best_err = None
                         continue
                     msg.forward_velocity = 0.0
                     msg.angular_velocity = 0.0
@@ -458,12 +465,14 @@ class ToolExecutor:
                                    f'상실) — 남은 거리 {dist:.2f}m')
                 bearing = m.atan2(dy, dx)
                 err = (bearing - self.node.yaw_rad() + m.pi) % (2 * m.pi) - m.pi
-                if abs(err) > 0.35:
-                    msg.forward_velocity = 0.0
-                    msg.angular_velocity = max(-0.5, min(0.5, 1.2 * err))
-                else:
-                    msg.forward_velocity = MAX_VX   # 보행 최고 속도
-                    msg.angular_velocity = max(-0.4, min(0.4, err))
+                # 블렌드 제어: 방향 오차에 비례해 감속하며 회전 —
+                # '정지 후 회전 ↔ 전진' 이분법(0.35rad 문턱)이 경계에서
+                # 덜컹임을 만들던 것을 연속 제어로 교체
+                speed = MAX_VX * max(0.0, 1.0 - abs(err) / 0.7)
+                # 목적지 근접 시 감속 (마지막 0.5m 구간)
+                speed = min(speed, MAX_VX * max(0.4, dist / 0.5))
+                msg.forward_velocity = speed
+                msg.angular_velocity = max(-0.5, min(0.5, 1.2 * err))
                 self.pub_vel.publish(msg)
                 time.sleep(0.1)
             best, best_t = None, time.monotonic()
