@@ -47,6 +47,13 @@ class AgentNode(Node):
             CompressedImage,
             '/aima/hal/sensor/rgbd_head_front/rgb_image/compressed',
             self.on_frame, qos_profile_sensor_data)
+        # 프리뷰 프레임(저해상 15fps) — 탐색 VLM 스캔용. 고해상 온디맨드
+        # 렌더는 프리뷰를 0.5s 얼리므로 스캔에 쓰지 않는다.
+        self.latest_preview = None
+        self.create_subscription(
+            CompressedImage, '/x2_sim/preview/compressed',
+            lambda m: setattr(self, 'latest_preview', bytes(m.data)),
+            qos_profile_sensor_data)
         for g in ('arm', 'leg', 'waist', 'head'):
             self.create_subscription(
                 JointStateArray, f'/aima/hal/joint/{g}/state',
@@ -93,6 +100,13 @@ class AgentNode(Node):
         self.create_subscription(
             String, '/x2_sim/carrying',
             lambda m: setattr(self, 'carrying', m.data), latched3)
+        # 시뮬 자세 상태 (stand/sit/lie) — 재시작 무관 동기화
+        self.sim_posture = 'stand'
+        latched4 = QoSProfile(depth=1)
+        latched4.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            String, '/x2_sim/posture_state',
+            lambda m: setattr(self, 'sim_posture', m.data), latched4)
 
         # 🧠 기억 삭제 (UI 버튼 하드와이어 경로 — LLM 무경유)
         self.create_subscription(

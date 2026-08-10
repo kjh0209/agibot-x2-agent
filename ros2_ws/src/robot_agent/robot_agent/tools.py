@@ -214,8 +214,11 @@ class ToolExecutor:
             st['mode'] = ACTION_NAMES.get(self.current_action(), '?')
         except RuntimeError as e:
             st['mode'] = f'조회 실패: {e}'
-        if self._lying:
-            st['posture'] = 'lying (누움 — upright=false 정상, 이동 불가)'
+        sp = getattr(self.node, 'sim_posture', 'stand')
+        if sp != 'stand':
+            st['posture'] = sp + (
+                ' (누움 — upright=false 정상, 이동 불가)'
+                if sp == 'lie' else '')
         # 탐색 모드(미지 공간): 지도 사전 지식을 주지 않는다 —
         # 물체는 2m 근접에서만 감지되고, 장소는 학습한 것만 노출
         from x2_sim.worlds import WORLDS as _W
@@ -558,10 +561,18 @@ class ToolExecutor:
         return None
 
     def _vlm_look(self):
-        """현재 시야 1프레임을 VLM(Haiku 비전)으로 분류. 실패 시 None."""
+        """현재 시야 1프레임을 VLM(Haiku 비전)으로 분류. 실패 시 None.
+
+        시뮬에서는 프리뷰(320x240) 프레임 사용 — 고해상 온디맨드 렌더는
+        라이브 영상을 스캔마다 0.5s씩 얼리는 부작용(사용자 제보)."""
+        frame = None
         if ROBOT_TARGET == 'sim':
-            self.pub_render_hq.publish(String(data='explore'))
-        frame = self.node.latest_frame(fresh=True, timeout=2.5)
+            time.sleep(0.15)            # 회전 직후 최신 프리뷰 확보
+            frame = getattr(self.node, 'latest_preview', None)
+        if frame is None:
+            if ROBOT_TARGET == 'sim':
+                self.pub_render_hq.publish(String(data='explore'))
+            frame = self.node.latest_frame(fresh=True, timeout=2.5)
         if frame is None:
             return None
         try:
@@ -602,12 +613,12 @@ class ToolExecutor:
                 break
             if math.hypot(pos[0] - last[0], pos[1] - last[1]) < 0.005:
                 stall += 1
-                if stall >= 5:
-                    break              # 가구 앞 밀착 = 접근 완료
+                if stall >= 3:
+                    break              # 가구 앞 도달 = 접근 완료
             else:
                 stall = 0
             last = pos
-            msg.forward_velocity = 0.2
+            msg.forward_velocity = 0.15   # 저속 — '들이받는' 인상 완화
             self.pub_vel.publish(msg)
             time.sleep(0.1)
         msg.forward_velocity = 0.0
@@ -1073,9 +1084,9 @@ class ToolExecutor:
     def stand_up(self):
         """일어서기 — 실기 McAction STAND_UP_DEFAULT(2005). 누운 상태
         (시뮬 lie)에서는 자세 토픽으로 기립."""
-        if self._lying and ROBOT_TARGET == 'sim':
+        if ROBOT_TARGET == 'sim' \
+                and getattr(self.node, 'sim_posture', 'stand') == 'lie':
             self.pub_posture.publish(String(data='stand'))
-            self._lying = False
             time.sleep(1.8)             # 역글라이드+기립 램프 완료 대기
             self.audit('stand_up', {}, True, 'stood from lie')
             return {'ok': '누운 데서 일어나 침대/바닥에서 내려왔음'}
@@ -1093,13 +1104,12 @@ class ToolExecutor:
         가구면 그 위로 올라가 눕고, 아니면 바닥에 눕는다."""
         if ROBOT_TARGET == 'real':
             return {'error': '실기 눕기는 미지원 (실기 v1 제외 — 안전 검토 필요)'}
-        if self._lying:
+        if getattr(self.node, 'sim_posture', 'stand') == 'lie':
             return {'ok': '이미 누워 있음'}
         if self.node.carrying:
             return {'error': f'{self.node.carrying}을(를) 들고는 누울 수 '
                              f'없음 — 먼저 put_down'}
         self.pub_posture.publish(String(data='lie'))
-        self._lying = True
         time.sleep(1.8)                 # 글라이드+눕기 램프 완료 대기
         self.audit('lie_down', {}, True, 'lying')
         return {'ok': ('누웠음 — 시야가 천장을 향한다. 누운 동안 이동 '

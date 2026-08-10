@@ -135,6 +135,10 @@ def load_model_with_camera_and_props(model_path: str,
             g.size = size
             g.pos = pos
             g.rgba = rgba
+            if opts.get('visual'):
+                # 시각 전용(문짝/문틀 상단 등) — 충돌·이동 차단 없음
+                g.contype = 0
+                g.conaffinity = 0
             static_names.append(name)
 
     model = spec.compile()
@@ -255,6 +259,15 @@ class X2SimNode(Node):
         self.create_subscription(
             String, '/x2_sim/posture',
             lambda m: self.set_posture(m.data.strip()), 10)
+        # 현재 자세 상태 latched 발행 — 에이전트가 재시작 무관하게 동기화
+        # (에이전트측 플래그 추적은 시뮬 재시작 시 낡아서 '이미 누워
+        #  있다' 오판을 만들었음)
+        from rclpy.qos import DurabilityPolicy, QoSProfile
+        _lat = QoSProfile(depth=1)
+        _lat.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.pub_posture_state = self.create_publisher(
+            String, '/x2_sim/posture_state', _lat)
+        self.pub_posture_state.publish(String(data=self.posture))
         self.pub_carrying.publish(String(data=''))
         # 주변 물체 브로드캐스트 (에이전트 상태 주입용)
         self.pub_objects = self.create_publisher(
@@ -388,11 +401,17 @@ class X2SimNode(Node):
         # 착석 강성 벡터 (허리/다리만 kp 5배, kd 2배 — apply_pd에서 사용)
         self._sit_gain = np.ones(self.model.nu)
         self._sit_kd_gain = np.ones(self.model.nu)
+        # 회전 강성 벡터 (허리만 3배 — 커브 휘청 완화)
+        self._turn_gain = np.ones(self.model.nu)
+        self._turn_kd_gain = np.ones(self.model.nu)
         for jname, ai in self.jname_to_ai.items():
             if any(k in (jname or '') for k in
                    ('waist', 'hip', 'knee', 'ankle')):
                 self._sit_gain[ai] = 5.0
                 self._sit_kd_gain[ai] = 2.0
+            if 'waist' in (jname or ''):
+                self._turn_gain[ai] = 3.0
+                self._turn_kd_gain[ai] = 1.7
 
         mujoco.mj_forward(self.model, self.data)
         self.q_ref = np.array(
@@ -439,6 +458,8 @@ class X2SimNode(Node):
             gid = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
             if gid >= 0:
+                if int(self.model.geom_contype[gid]) == 0:
+                    continue          # 시각 전용 소품 — 차단 구역 제외
                 self.prop_gids.add(gid)
                 p = self.model.geom_pos[gid]
                 s = self.model.geom_size[gid]
@@ -585,42 +606,88 @@ class X2SimNode(Node):
                 best = max(best, top)
         return best
 
-    def set_posture(self, posture: str):
-        """자세 전환 (stand/sit/lie) — 즉시 점프가 아니라 1.5s 램프.
+    def _find_platform(self, direction, dists):
+        """direction(+1 전방/-1 후방) 원뿔 스캔으로 낮은 가구 탐색.
 
-        lie: 전방 0.55m 지점(침대/소파 위면 그 위, 아니면 바닥)으로
-        글라이드하며 등을 대고 눕는다(베이스 피치 -80°). 일어설 때는
-        역글라이드로 내려온다."""
+        좌우 ±0.28m 오프셋도 훑는다 — 도착 지점이 가구와 살짝 어긋나
+        있어도(문 축 정렬 등) 잡아낸다. 반환: (글라이드 벡터 x, y,
+        윗면 높이) 또는 None."""
+        c, ss = math.cos(self.base_yaw), math.sin(self.base_yaw)
+        px, py = -ss, c                 # 좌측 수직 방향
+        for d in dists:
+            for off in (0.0, 0.28, -0.28):
+                x = (self.base_xyz[0] + direction * d * c + off * px)
+                y = (self.base_xyz[1] + direction * d * ss + off * py)
+                top = self._platform_top(x, y)
+                if top > 0.05:
+                    gx = direction * d * c + off * px
+                    gy = direction * d * ss + off * py
+                    return gx, gy, top
+        return None
+
+    def set_posture(self, posture: str):
+        """자세 전환 (stand/sit/lie) — 1.5s 램프, ★가구 범용.
+
+        sit: 주변 낮은 가구(침대/소파/의자 무엇이든) 자동 감지 —
+          뒤에 있으면 걸터앉고, 앞에 있으면 반턴(180°)해서 앉는다.
+          없으면 제자리 바닥 높이 앉기.
+        lie: 전방의 낮은 가구를 찾아 그 위로 올라가 눕고, 없으면 바닥.
+        특정 가구 이름/장소 설정에 의존하지 않는다 (범용성 원칙)."""
         if posture not in ('stand', 'sit', 'lie'):
             return
         yaw = self.base_yaw
         c, s = math.cos(yaw), math.sin(yaw)
         glide = (0.0, 0.0)
+        dyaw = 0.0
         if posture == 'sit':
-            tgt = {'z': self.base_z0 - 0.23, 'pitch': 0.0,
-                   'joints': dict(self.SIT_JOINTS)}
+            back = self._find_platform(-1, (0.25, 0.4, 0.55, 0.7))
+            front = None if back else self._find_platform(
+                +1, (0.25, 0.4, 0.55, 0.7))
+            hit = back or front
+            if hit:
+                gx, gy, top = hit
+                n = math.hypot(gx, gy) or 1.0
+                # 감지 지점보다 0.10m 더 깊이 걸터앉기
+                glide = (gx * (1 + 0.10 / n), gy * (1 + 0.10 / n))
+                if front:               # 앞 가구 → 반턴 후 걸터앉기
+                    dyaw = math.pi
+                tgt = {'z': top + 0.30, 'pitch': 0.0,
+                       'joints': dict(self.SIT_JOINTS)}
+            else:
+                tgt = {'z': self.base_z0 - 0.23, 'pitch': 0.0,
+                       'joints': dict(self.SIT_JOINTS)}
+            self._sit_entry_glide = glide
         elif posture == 'lie':
-            gx, gy = 0.55 * c, 0.55 * s
-            top = self._platform_top(self.base_xyz[0] + gx,
-                                     self.base_xyz[1] + gy)
+            found = self._find_platform(
+                +1, (0.35, 0.5, 0.65, 0.8, 0.95, 1.1))
+            if found:
+                gx, gy, top = found     # 감지 지점보다 0.30m 안쪽까지
+                n = math.hypot(gx, gy) or 1.0
+                glide = (gx * (1 + 0.30 / n), gy * (1 + 0.30 / n))
+            else:
+                glide, top = (0.45 * c, 0.45 * s), 0.0
             tgt = {'z': top + 0.16, 'pitch': -1.40, 'joints': {}}
-            glide = (gx, gy)
             self._lie_entry_glide = glide
         else:
             tgt = {'z': self.base_z0, 'pitch': 0.0, 'joints': {}}
             if self.posture == 'lie':      # 눕던 자리에서 역글라이드
                 glide = (-self._lie_entry_glide[0],
                          -self._lie_entry_glide[1])
-            elif self.posture == 'sit':    # 소파에서 반보 전진
-                glide = (0.18 * c, 0.18 * s)
+            elif self.posture == 'sit':    # 앉던 자리에서 앞으로 빠져나옴
+                eg = getattr(self, '_sit_entry_glide', (0.0, 0.0))
+                glide = (-eg[0] + 0.10 * c, -eg[1] + 0.10 * s)
         self._pose_from = {'z': self._pose_cur['z'],
                            'pitch': self._pose_cur['pitch'],
                            'joints': dict(self._pose_cur['joints'])}
         self._pose_to = tgt
         self._pose_glide = glide
+        self._pose_dyaw = dyaw
         self._pose_t = 0.0
         self.posture = posture
-        self.get_logger().info(f'자세 전환 시작: {posture} (1.5s 램프)')
+        if hasattr(self, 'pub_posture_state'):
+            self.pub_posture_state.publish(String(data=posture))
+        self.get_logger().info(f'자세 전환 시작: {posture} (1.5s 램프'
+                               + (', 반턴' if dyaw else '') + ')')
 
     def posture_offsets(self):
         j = self._pose_cur['joints']
@@ -812,6 +879,11 @@ class X2SimNode(Node):
                 if ai is not None:
                     q_target[ai] += delta
         kp, kd = self.kp, self.kd
+        # 회전 중 허리 강성 보강 — 유연한 허리가 원심/관성으로 휘어
+        # 커브마다 카메라가 휘청이던 것(사용자 제보) 완화
+        if abs(self.vel_smooth[2]) > 0.05:
+            kp = kp * self._turn_gain
+            kd = kd * self._turn_kd_gain
         if self.posture != 'stand' or self._pose_t < 1.0:
             # 착석 중 허리/다리 강성 상향 — 소파 접촉력이 유연한(kp=120)
             # 관절을 밀어 카메라가 기울던 문제(허리 0.29rad 편차 실측).
@@ -867,6 +939,7 @@ class X2SimNode(Node):
             self.base_xyz[0] += self._pose_glide[0] * ds
             self.base_xyz[1] += self._pose_glide[1] * ds
             self.base_xyz[2] = self._pose_cur['z']
+            self.base_yaw += getattr(self, '_pose_dyaw', 0.0) * ds
         fresh = self.data.time - self.cmd_time <= 0.5
         target = self.cmd_vel if fresh else np.zeros(3)
         if self.posture == 'lie':
