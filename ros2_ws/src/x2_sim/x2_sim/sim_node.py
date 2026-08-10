@@ -187,7 +187,17 @@ class X2SimNode(Node):
 
         # 월드 로드 (모델/매핑/베이스/소품/렌더러 전부 이 안에서 구성 —
         # 런타임 월드 전환 시에도 같은 메서드 재사용)
-        self._build_world(str(self.get_parameter('world').value))
+        # 마지막 월드 복원 — 재시작(수퍼바이저 등)마다 home으로 돌아가면
+        # 탐색이 초기화된 것처럼 보인다 (학습 지도는 원래 영속).
+        world_param = str(self.get_parameter('world').value)
+        if world_param == DEFAULT_WORLD:
+            try:
+                last = open('/ws/log/last_world.txt').read().strip()
+                if last in WORLDS:
+                    world_param = last
+            except Exception:
+                pass
+        self._build_world(world_param)
 
         # 퍼블리셔 (실기 토픽명)
         self.pub_joint = {
@@ -475,6 +485,11 @@ class X2SimNode(Node):
         self.mc.reset()
         self.pub_world.publish(String(data=name))
         self.pub_carrying.publish(String(data=''))
+        try:                                # 재시작 시 복원용
+            with open('/ws/log/last_world.txt', 'w') as f:
+                f.write(name)
+        except Exception:
+            pass
         # (즉시 렌더 특례 제거 — 프리뷰 스레드가 0.1s 내 새 씬을 발행)
         self.get_logger().info(f'월드 전환 완료: {name}')
 
