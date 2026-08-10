@@ -288,6 +288,9 @@ class X2SimNode(Node):
         self._preview_thread = threading.Thread(
             target=self._preview_loop, daemon=True)
         self._preview_thread.start()
+        # 전 월드 백그라운드 예열 — 전환 시 컴파일(~2s)+렌더러 생성이
+        # 없게 미리 캐시. 부팅 후 수십 초에 걸쳐 조용히 진행.
+        threading.Thread(target=self._warm_worlds, daemon=True).start()
 
         # 물리 스텝: publish_rate 주기마다 실시간 분량만큼 서브스텝
         rate = float(self.get_parameter('publish_rate').value)
@@ -444,18 +447,18 @@ class X2SimNode(Node):
         self._pen_last = 0.0
         self._blocked_logged = False
 
-        for attr in ('renderer', 'renderer_prev'):
-            old = getattr(self, attr, None)
-            if old is not None:
-                try:
-                    old.close()
-                except Exception:
-                    pass
-        self.renderer = mujoco.Renderer(
-            self.model, height=self.cam_size[1], width=self.cam_size[0])
-        # 프리뷰(라이브 영상)용 저해상도 렌더러 — 전용 스레드가 연속 렌더
-        self.renderer_prev = mujoco.Renderer(
-            self.model, height=self.prev_size[1], width=self.prev_size[0])
+        # 렌더러도 월드별 캐시 — 전환마다 OSMesa 컨텍스트를 재생성하던
+        # 것이 전환 지연의 주범(모델 컴파일과 함께). 캐시 스왑이면 즉시.
+        if not hasattr(self, '_renderer_cache'):
+            self._renderer_cache = {}
+        rc = self._renderer_cache.get(world_name)
+        if rc is None:
+            rc = (mujoco.Renderer(self.model, height=self.cam_size[1],
+                                  width=self.cam_size[0]),
+                  mujoco.Renderer(self.model, height=self.prev_size[1],
+                                  width=self.prev_size[0]))
+            self._renderer_cache[world_name] = rc
+        self.renderer, self.renderer_prev = rc
         self.get_logger().info(
             f'월드 로드: {world_name} — 소품 {len(prop_names)}개, '
             f'nq={self.model.nq}, nu={self.model.nu}')
@@ -949,6 +952,33 @@ class X2SimNode(Node):
 
         self.cam_info.header.stamp = stamp
         self.pub_cam_info.publish(self.cam_info)
+
+    def _warm_worlds(self):
+        """모든 월드 예열: 모델 컴파일(락 밖, CPU) + 렌더러 생성(GL 직렬화).
+
+        전환 지연의 두 지연원을 부팅 직후 백그라운드로 선지불한다.
+        렌더 품질/주기는 건드리지 않음 — 캐시일 뿐."""
+        model_path = self.get_parameter('model_path').value
+        time.sleep(3.0)                     # 부팅 안정화 후 시작
+        for name in list(WORLDS):
+            if not rclpy.ok():
+                return
+            try:
+                if name not in self._world_cache:
+                    compiled = load_model_with_camera_and_props(
+                        model_path, name)
+                    self._world_cache[name] = compiled
+                if name not in self._renderer_cache:
+                    m = self._world_cache[name][0]
+                    with self.render_lock, self.prev_lock:
+                        self._renderer_cache[name] = (
+                            mujoco.Renderer(m, height=self.cam_size[1],
+                                            width=self.cam_size[0]),
+                            mujoco.Renderer(m, height=self.prev_size[1],
+                                            width=self.prev_size[0]))
+                    self.get_logger().info(f'월드 예열 완료: {name}')
+            except Exception as e:
+                self.get_logger().warning(f'월드 예열 실패({name}): {e}')
 
     def _preview_loop(self):
         """저해상도 프리뷰를 연속 렌더 → 라이브 영상.
