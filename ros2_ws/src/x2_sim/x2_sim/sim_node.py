@@ -680,8 +680,13 @@ class X2SimNode(Node):
                        'joints': dict(self.SIT_JOINTS)}
             self._sit_entry_glide = glide
         elif posture == 'lie':
+            # 전방 우선, 없으면 후방(걸터앉은 자세에서 뒤로 벌렁 눕기 —
+            # 앉기가 가구를 등지므로 후방 스캔이 없으면 바닥에 누움)
             found = self._find_platform(
                 +1, (0.35, 0.5, 0.65, 0.8, 0.95, 1.1))
+            if found is None:
+                found = self._find_platform(
+                    -1, (0.25, 0.4, 0.55, 0.7, 0.85))
             if found:
                 gx, gy, top = found     # 감지 지점보다 0.30m 안쪽까지
                 n = math.hypot(gx, gy) or 1.0
@@ -689,8 +694,10 @@ class X2SimNode(Node):
             else:
                 glide, top = (0.45 * c, 0.45 * s), 0.0
             # +0.22: 몸이 매트리스에 파묻히면 접촉 지터로 천장 시야가
-            # 계속 흔들림 (사용자 제보) — 접촉을 최소화하는 높이
-            tgt = {'z': top + 0.22, 'pitch': -1.40, 'joints': {}}
+            # 계속 흔들림 (사용자 제보) — 접촉을 최소화하는 높이.
+            # 피치 -1.72(-98°): 카메라 자체가 18° 하향 장착이라 -80°로는
+            # 시선이 윗벽에 걸림("천장 안 보고 있는데?" 제보) — 보정치
+            tgt = {'z': top + 0.22, 'pitch': -1.72, 'joints': {}}
             self._lie_entry_glide = glide
         else:
             tgt = {'z': self.base_z0, 'pitch': 0.0, 'joints': {}}
@@ -1001,6 +1008,19 @@ class X2SimNode(Node):
             return
         self._set_door(best[1], 'open' if want == 'open' else 'closed')
 
+    def _tall_pen(self, x, y):
+        """키 큰 구역(벽/닫힌 문/장롱 — 윗면 0.5m 이상)만의 관통량."""
+        worst = 0.0
+        for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
+            if top < 0.5:
+                continue
+            dx = abs(x - cx) - hx
+            dy = abs(y - cy) - hy
+            pen = margin - math.hypot(max(0.0, dx), max(0.0, dy))
+            if pen > worst:
+                worst = pen
+        return worst
+
     def _zone_pen(self, x, y):
         """(x,y)에서 가구 차단 구역 관통량(최댓값). 0이면 자유 공간."""
         worst = 0.0
@@ -1041,8 +1061,15 @@ class X2SimNode(Node):
                 joints[k] = a + (b2 - a) * s1
             self._pose_cur['joints'] = joints
             ds = s1 - s0
-            self.base_xyz[0] += self._pose_glide[0] * ds
-            self.base_xyz[1] += self._pose_glide[1] * ds
+            # 글라이드 게이팅: 낮은 가구(침대/소파) 위 이동은 허용하되,
+            # ★키 큰 구역(벽/닫힌 문/장롱)은 관통 금지 — 문 앞에서
+            # 눕기/앉기가 실행되면 글라이드가 닫힌 문을 뚫던 사고 방지
+            gnx = self.base_xyz[0] + self._pose_glide[0] * ds
+            gny = self.base_xyz[1] + self._pose_glide[1] * ds
+            if self._tall_pen(gnx, gny) <= self._tall_pen(
+                    self.base_xyz[0], self.base_xyz[1]) + 1e-9:
+                self.base_xyz[0] = gnx
+                self.base_xyz[1] = gny
             self.base_xyz[2] = self._pose_cur['z']
             self.base_yaw += getattr(self, '_pose_dyaw', 0.0) * ds
         fresh = self.data.time - self.cmd_time <= 0.5

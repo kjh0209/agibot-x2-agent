@@ -1205,6 +1205,12 @@ class ToolExecutor:
                 and getattr(self.node, 'sim_posture', 'stand') == 'lie':
             self.pub_posture.publish(String(data='stand'))
             time.sleep(1.8)             # 역글라이드+기립 램프 완료 대기
+            try:                        # MC 모드가 SIT에 남아있으면 정리
+                if self.current_action() == int(McAction.SIT_DOWN_DEFAULT):
+                    self.ensure_source()
+                    self.set_action(int(McAction.STAND_UP_DEFAULT))
+            except RuntimeError:
+                pass
             self.audit('stand_up', {}, True, 'stood from lie')
             return {'ok': '누운 데서 일어나 침대/바닥에서 내려왔음'}
         try:
@@ -1226,6 +1232,16 @@ class ToolExecutor:
         if self.node.carrying:
             return {'error': f'{self.node.carrying}을(를) 들고는 누울 수 '
                              f'없음 — 먼저 put_down'}
+        # 앉은 상태에서 눕기: MC 모드가 SIT에 잠긴 채 자세만 바뀌면
+        # 이후 이동이 전부 게이트에 막힘 — 먼저 정식으로 일어난다
+        try:
+            if self.current_action() == int(McAction.SIT_DOWN_DEFAULT):
+                self.ensure_source()
+                self.set_action(int(McAction.STAND_UP_DEFAULT))
+                self._wait_mode(int(McAction.STAND_DEFAULT))
+                time.sleep(1.6)          # 기립 램프 완료
+        except RuntimeError:
+            pass
         self.pub_posture.publish(String(data='lie'))
         time.sleep(1.8)                 # 글라이드+눕기 램프 완료 대기
         self.audit('lie_down', {}, True, 'lying')
