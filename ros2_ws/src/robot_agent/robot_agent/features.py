@@ -53,6 +53,11 @@ FEATURES = {
                        'real_available': False},
     'forget_map':     {'kind': 'tool', 'tier': 'real_needs_work',
                        'real_available': False},
+    # 문 조작 — 실기는 핸드 매니퓰레이션 필요 (v1 제외)
+    'open_door':      {'kind': 'tool', 'tier': 'real_needs_work',
+                       'real_available': False},
+    'close_door':     {'kind': 'tool', 'tier': 'real_needs_work',
+                       'real_available': False},
 
     # ---------- UI ----------
     'world_switch':  {'kind': 'ui', 'tier': 'sim_only'},  # 🌍 드롭다운

@@ -213,6 +213,19 @@ ALL_TOOLS = [
         },
     },
     {
+        'name': 'open_door',
+        'description': ('가장 가까운 문(1.35m 내)을 연다. 상태의 doors에 '
+                        '문 위치·상태가 있다. 닫힌 문은 통과 불가 — 이동이 '
+                        '문 앞에서 막히면 자동으로 열리기도 하지만, 직접 '
+                        '열 수도 있다.'),
+        'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
+        'name': 'close_door',
+        'description': '가장 가까운 문(1.35m 내)을 닫는다.',
+        'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
         'name': 'forget_map',
         'description': ('현재 탐색 공간에 대한 학습 기억(장소/길/물체)을 '
                         '전부 지운다 — 처음 보는 공간 상태로 되돌리기. '

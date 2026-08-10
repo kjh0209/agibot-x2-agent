@@ -141,6 +141,17 @@ def load_model_with_camera_and_props(model_path: str,
                 g.conaffinity = 0
             static_names.append(name)
 
+    # 기능형 문 — 닫힘 포즈(통로 가로막음)로 생성. 런타임에 열면
+    # 문설주 쪽으로 회전·이동 + 충돌/차단 해제 (sim_node._set_door)
+    for d in world.get('doors', []):
+        g = wb.add_geom()
+        g.name = d['name']
+        g.type = GEOM_TYPES['box']
+        g.size = list(d['size'])
+        g.pos = [d['closed_pos'][0], d['closed_pos'][1], d['size'][2]]
+        g.rgba = [0.52, 0.38, 0.25, 1.0]
+        static_names.append(d['name'])
+
     model = spec.compile()
     # CPU(OSMesa) 렌더 최적화 — 실측: 그림자맵 4096 + MSAA 4x가 프레임당
     # ~1.2s를 차지 (해상도 무관 고정비용). 끄면 640x480 기준 1.9s→0.5s.
@@ -259,6 +270,9 @@ class X2SimNode(Node):
         self.create_subscription(
             String, '/x2_sim/posture',
             lambda m: self.set_posture(m.data.strip()), 10)
+        # 문 조작 (open/close — 가장 가까운 문)
+        self.create_subscription(
+            String, '/x2_sim/door', self.on_door, 10)
         # 현재 자세 상태 latched 발행 — 에이전트가 재시작 무관하게 동기화
         # (에이전트측 플래그 추적은 시뮬 재시작 시 낡아서 '이미 누워
         #  있다' 오판을 만들었음)
@@ -412,6 +426,15 @@ class X2SimNode(Node):
             if 'waist' in (jname or ''):
                 self._turn_gain[ai] = 3.0
                 self._turn_kd_gain[ai] = 1.7
+        # 머리(카메라 마운트) 관절은 상시 강성 — 관성으로 머리가 흔들려
+        # '넘어질 것 같은' 인상을 주던 것 억제 (실기의 헤드 스태빌라이저
+        # 역할을 시뮬에서 대신)
+        self._head_gain = np.ones(self.model.nu)
+        self._head_kd_gain = np.ones(self.model.nu)
+        for jname, ai in self.jname_to_ai.items():
+            if 'head' in (jname or ''):
+                self._head_gain[ai] = 4.0
+                self._head_kd_gain[ai] = 2.0
 
         mujoco.mj_forward(self.model, self.data)
         self.q_ref = np.array(
@@ -449,31 +472,30 @@ class X2SimNode(Node):
         # 기하 규칙으로 게이팅: 결정론적, 노이즈 0, 팔다리 무관.
         # 낮은 가구(윗면 z<0.5 — 소파/침대/티테이블 등 앉는 면)는 여유를
         # 작게(0.12m) 둬 도킹 밀착이 가능하고, 벽/장롱류는 0.30m.
-        self.block_zones = []
-        for name in prop_names:
-            # 바닥/천장/러그는 통행면·머리 위 — 차단 대상 아님
-            # (천장을 2D 차단 구역에 넣으면 전 면적이 막힌다!)
-            if '_floor' in name or '_ceiling' in name or name == 'rug':
-                continue
+        self._zone_prop_names = list(prop_names)
+        self._rebuild_zones()
+
+        # 기능형 문 등록 + 초기 상태 (프로세스당 월드별 1회만 init 적용
+        # — 이후엔 마지막 상태 유지, 실제 문처럼)
+        self.doors = {}
+        for dd in WORLDS[world_name].get('doors', []):
             gid = mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
-            if gid >= 0:
-                if int(self.model.geom_contype[gid]) == 0:
-                    continue          # 시각 전용 소품 — 차단 구역 제외
-                self.prop_gids.add(gid)
-                p = self.model.geom_pos[gid]
-                s = self.model.geom_size[gid]
-                gtype = int(self.model.geom_type[gid])
-                if gtype == int(mujoco.mjtGeom.mjGEOM_BOX):
-                    hx, hy, top = float(s[0]), float(s[1]), \
-                        float(p[2]) + float(s[2])
-                else:                      # cylinder/sphere: 반경 기반
-                    hx = hy = float(s[0])
-                    top = float(p[2]) + float(s[1] if gtype == int(
-                        mujoco.mjtGeom.mjGEOM_CYLINDER) else s[0])
-                margin = 0.30 if top >= 0.5 else 0.12
-                self.block_zones.append(
-                    (float(p[0]), float(p[1]), hx, hy, margin, top, name))
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, dd['name'])
+            if gid < 0:
+                continue
+            self.doors[dd['name']] = {
+                'gid': gid,
+                'closed_pos': dd['closed_pos'],
+                'open_pos': dd['open_pos'],
+            }
+        if not hasattr(self, '_door_init_done'):
+            self._door_init_done = set()
+        if world_name not in self._door_init_done:
+            self._door_init_done.add(world_name)
+            for dd in WORLDS[world_name].get('doors', []):
+                if dd.get('init') == 'open' and dd['name'] in self.doors:
+                    self._set_door(dd['name'], 'open', rebuild=False)
+            self._rebuild_zones()
         self._contact_prev = False
         self._pen_last = 0.0
         self._blocked_logged = False
@@ -666,7 +688,9 @@ class X2SimNode(Node):
                 glide = (gx * (1 + 0.30 / n), gy * (1 + 0.30 / n))
             else:
                 glide, top = (0.45 * c, 0.45 * s), 0.0
-            tgt = {'z': top + 0.16, 'pitch': -1.40, 'joints': {}}
+            # +0.22: 몸이 매트리스에 파묻히면 접촉 지터로 천장 시야가
+            # 계속 흔들림 (사용자 제보) — 접촉을 최소화하는 높이
+            tgt = {'z': top + 0.22, 'pitch': -1.40, 'joints': {}}
             self._lie_entry_glide = glide
         else:
             tgt = {'z': self.base_z0, 'pitch': 0.0, 'joints': {}}
@@ -726,8 +750,14 @@ class X2SimNode(Node):
                 p = self.data.geom_xpos[gid]
                 lands[friendly] = {'x': round(float(p[0]), 2),
                                    'y': round(float(p[1]), 2)}
+        doors = {}
+        for name, d in self.doors.items():
+            doors[name] = {
+                'x': d['closed_pos'][0], 'y': d['closed_pos'][1],
+                'state': ('open' if int(
+                    self.model.geom_contype[d['gid']]) == 0 else 'closed')}
         payload = {'world': self.world_name, 'carrying': self.carrying,
-                   'objects': objs, 'landmarks': lands}
+                   'objects': objs, 'landmarks': lands, 'doors': doors}
         self.pub_objects.publish(String(
             data=json.dumps(payload, ensure_ascii=False)))
 
@@ -878,13 +908,19 @@ class X2SimNode(Node):
                 ai = self.jname_to_ai.get(jname)
                 if ai is not None:
                     q_target[ai] += delta
-        kp, kd = self.kp, self.kd
+        kp = self.kp * self._head_gain      # 머리 상시 안정화
+        kd = self.kd * self._head_kd_gain
         # 회전 중 허리 강성 보강 — 유연한 허리가 원심/관성으로 휘어
         # 커브마다 카메라가 휘청이던 것(사용자 제보) 완화
         if abs(self.vel_smooth[2]) > 0.05:
             kp = kp * self._turn_gain
             kd = kd * self._turn_kd_gain
-        if self.posture != 'stand' or self._pose_t < 1.0:
+        if self.posture == 'lie':
+            # 누운 자세: 전신 강성/감쇠 상향 — 침구 접촉 지터로 카메라가
+            # 계속 떨리던 것(사용자 제보) 억제 (팔·목 포함 전 관절)
+            kp = self.kp * 4.0
+            kd = self.kd * 2.5
+        elif self.posture != 'stand' or self._pose_t < 1.0:
             # 착석 중 허리/다리 강성 상향 — 소파 접촉력이 유연한(kp=120)
             # 관절을 밀어 카메라가 기울던 문제(허리 0.29rad 편차 실측).
             # 실기에서는 MC가 자체 자세 제어를 하므로 시뮬 전용 보정.
@@ -895,6 +931,75 @@ class X2SimNode(Node):
             tau, self.model.actuator_ctrlrange[:, 0],
             self.model.actuator_ctrlrange[:, 1]) \
             if self.model.actuator_ctrllimited.any() else tau
+
+    def _rebuild_zones(self):
+        """가구 차단 구역 재구축 — 현재 geom 포즈/contype 기준
+        (문 열림/닫힘 토글 시에도 호출)."""
+        self.block_zones = []
+        for name in self._zone_prop_names:
+            # 바닥/천장/러그는 통행면·머리 위 — 차단 대상 아님
+            # (천장을 2D 차단 구역에 넣으면 전 면적이 막힌다!)
+            if '_floor' in name or '_ceiling' in name or name == 'rug':
+                continue
+            gid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            if gid < 0:
+                continue
+            if int(self.model.geom_contype[gid]) == 0:
+                continue              # 시각 전용/열린 문 — 차단 제외
+            self.prop_gids.add(gid)
+            p = self.model.geom_pos[gid]
+            s = self.model.geom_size[gid]
+            gtype = int(self.model.geom_type[gid])
+            if gtype == int(mujoco.mjtGeom.mjGEOM_BOX):
+                hx, hy, top = float(s[0]), float(s[1]), \
+                    float(p[2]) + float(s[2])
+            else:                      # cylinder/sphere: 반경 기반
+                hx = hy = float(s[0])
+                top = float(p[2]) + float(s[1] if gtype == int(
+                    mujoco.mjtGeom.mjGEOM_CYLINDER) else s[0])
+            margin = 0.30 if top >= 0.5 else 0.12
+            self.block_zones.append(
+                (float(p[0]), float(p[1]), hx, hy, margin, top, name))
+
+    def _set_door(self, name, state, rebuild=True):
+        """문 상태 전환 — open: 문설주로 접힘(시각만)/closed: 통로 차단."""
+        d = self.doors.get(name)
+        if d is None:
+            return
+        gid = d['gid']
+        if state == 'open':
+            self.model.geom_pos[gid][0] = d['open_pos'][0]
+            self.model.geom_pos[gid][1] = d['open_pos'][1]
+            self.model.geom_quat[gid][:] = (0.70710678, 0.0, 0.0,
+                                            0.70710678)
+            self.model.geom_contype[gid] = 0
+            self.model.geom_conaffinity[gid] = 0
+        else:
+            self.model.geom_pos[gid][0] = d['closed_pos'][0]
+            self.model.geom_pos[gid][1] = d['closed_pos'][1]
+            self.model.geom_quat[gid][:] = (1.0, 0.0, 0.0, 0.0)
+            self.model.geom_contype[gid] = 1
+            self.model.geom_conaffinity[gid] = 1
+        if rebuild:
+            self._rebuild_zones()
+        self.get_logger().info(f'문 {name}: {state}')
+
+    def on_door(self, msg: String):
+        """가장 가까운 문(1.35m 내)을 열거나 닫는다."""
+        want = msg.data.strip()
+        if want not in ('open', 'close'):
+            return
+        best = None
+        for name, d in self.doors.items():
+            dist = math.hypot(self.base_xyz[0] - d['closed_pos'][0],
+                              self.base_xyz[1] - d['closed_pos'][1])
+            if dist < 1.35 and (best is None or dist < best[0]):
+                best = (dist, name)
+        if best is None:
+            self.get_logger().info('근처(1.35m)에 문 없음 — 무시')
+            return
+        self._set_door(best[1], 'open' if want == 'open' else 'closed')
 
     def _zone_pen(self, x, y):
         """(x,y)에서 가구 차단 구역 관통량(최댓값). 0이면 자유 공간."""
@@ -958,10 +1063,19 @@ class X2SimNode(Node):
             ny = self.base_xyz[1] + (s * self.vel_smooth[0]
                                      + c * self.vel_smooth[1]) * dt
             # 기하 게이팅: 가구 구역 관통이 늘지 않는 이동만 승인
-            # (자유 이동·탈출·구역 경계 미끄러짐 허용, 파고들기 차단)
+            # (자유 이동·탈출·구역 경계 미끄러짐 허용, 파고들기 차단).
+            # ★얕은 관통(≤6cm)은 항상 허용 — 여유 반경이 겹치는 구석
+            # (옷장-벽 사이 등)에서 모든 방향이 '관통 증가'로 계산돼
+            # 갇히는 국소 최소점 함정 방지 (복도 끝 못 나오던 실측 사고).
+            # 6cm는 실제 가구 면까지 최소 6cm(낮은 가구)~24cm(벽) 여유.
             pen_new = self._zone_pen(nx, ny)
-            if pen_new <= 1e-9 or pen_new <= self._zone_pen(
-                    self.base_xyz[0], self.base_xyz[1]) + 1e-9:
+            pen_old = self._zone_pen(self.base_xyz[0], self.base_xyz[1])
+            # 얕은 관통(≤6cm) 허용은 '이미 여유 구역 안'일 때만 —
+            # 자유 공간→구역 진입은 여전히 경계(0)에서 차단해 가구/벽에
+            # 다가붙는 '부딪힘' 인상을 만들지 않으면서, 구석 국소 최소점
+            # 함정에선 빠져나올 수 있게 한다.
+            if pen_new <= pen_old + 1e-9 or (
+                    pen_old > 1e-9 and pen_new <= 0.06):
                 self.base_xyz[0] = nx
                 self.base_xyz[1] = ny
             elif not self._blocked_logged:

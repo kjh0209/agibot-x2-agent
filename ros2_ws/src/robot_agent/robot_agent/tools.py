@@ -96,6 +96,8 @@ class ToolExecutor:
         # 자세 직접 전환 (눕기 — 시뮬 전용)
         self.pub_posture = node.create_publisher(
             String, '/x2_sim/posture', 10)
+        # 문 조작
+        self.pub_door = node.create_publisher(String, '/x2_sim/door', 10)
         self._lying = False
         # 집기/놓기 (시뮬 전용 — 실기는 핸드 하드웨어 + HandCommand)
         self.pub_grasp = node.create_publisher(String, '/x2_sim/grasp', 10)
@@ -229,6 +231,9 @@ class ToolExecutor:
                     k: v for k, v in st['nearby_objects_dist_m'].items()
                     if v <= 2.0}
             st.pop('nearby_landmarks_dist_m', None)
+            if 'doors' in st:      # 문도 2.5m 근접에서만 감지
+                st['doors'] = {k: v for k, v in st['doors'].items()
+                               if v['dist_m'] <= 2.5}
             lm = self._learned(self.node.current_world)
             st['learned_places'] = sorted(lm['places'].keys())
             if lm.get('objects_seen'):
@@ -605,15 +610,28 @@ class ToolExecutor:
         msg = McLocomotionVelocity()
         msg.source = SOURCE
         last, stall = start, 0
-        t_end = time.monotonic() + 8.0
+        t0 = time.monotonic()
+        t_end = t0 + 8.0
         while time.monotonic() < t_end and not self._stop_requested:
             pos = self.node.odom
             lm['cells'].add(self._cell(*pos))
-            if math.hypot(pos[0] - start[0], pos[1] - start[1]) >= 1.6:
+            # 상한 3.2m — 1.6m는 문 너머로 본 가구(2m+)에 못 미쳐
+            # '침대'가 방 밖 중간 지점에 등록되던 원인이었음
+            if math.hypot(pos[0] - start[0], pos[1] - start[1]) >= 3.2:
                 break
-            if math.hypot(pos[0] - last[0], pos[1] - last[1]) < 0.005:
+            # ★가속 램프 유예 1초 — 출발 직후 저속 구간을 '막힘'으로
+            # 오판해 그 자리(문간 등)를 장소로 등록하던 버그의 수정.
+            # ('침대' 장소가 침대에서 1m 떨어진 문 축에 박히던 원인)
+            if time.monotonic() - t0 > 1.0 and \
+                    math.hypot(pos[0] - last[0], pos[1] - last[1]) < 0.005:
                 stall += 1
                 if stall >= 3:
+                    # 닫힌 문에 막힌 것이면 열고 계속 접근 ('침대'가
+                    # 문 앞 위치로 등록되던 사고 방지)
+                    if self._try_open_door():
+                        stall = 0
+                        t0 = time.monotonic()   # 램프 유예 재시작
+                        continue
                     break              # 가구 앞 도달 = 접근 완료
             else:
                 stall = 0
@@ -628,6 +646,10 @@ class ToolExecutor:
                               'yaw': round(self.node.yaw_rad(), 2)}
         self.node.notify_event(f'탐색: {name} 발견 → 장소로 기억함')
         self._dock(max_dist=0.5, forward=False)   # 물러나 탐색 재개
+
+    # 구조물/무의미 라벨 — 장소로 등록하지 않음 (개방 어휘의 노이즈 필터)
+    LABEL_BLACKLIST = {'벽', '바닥', '문', '천장', '기둥', '창문', '모름',
+                       '복도', '코너', '구석', '모서리'}
 
     @staticmethod
     def _clean_label(s):
@@ -661,6 +683,8 @@ class ToolExecutor:
                         'near': [round(pos[0], 2), round(pos[1], 2)]}
             for fname in (res.get('furniture') or []):
                 fname = self._clean_label(fname)
+                if fname in self.LABEL_BLACKLIST:
+                    continue
                 if fname and fname not in lm['places']:
                     self._approach_and_register(lm, fname, yaw)
                     self._save_learned(world)
@@ -696,8 +720,13 @@ class ToolExecutor:
                 break
             cell = self._cell(*pos)
             lm['cells'].add(cell)
+            # 근처 문 학습 (탐색이 문 존재·상태까지 파악)
+            for dn, dd in (getattr(self.node, 'doors_info', {}) or {}).items():
+                if math.hypot(dd['x'] - pos[0], dd['y'] - pos[1]) < 2.5:
+                    lm.setdefault('doors', {})[dn] = {
+                        'x': dd['x'], 'y': dd['y']}
             if last_scan is None or (abs(cell[0] - last_scan[0])
-                                     + abs(cell[1] - last_scan[1])) >= 2:
+                                     + abs(cell[1] - last_scan[1])) >= 3:
                 self._scan_and_register(lm, world)
                 last_scan = self._cell(*(self.node.odom or pos))
                 continue
@@ -771,6 +800,52 @@ class ToolExecutor:
         self.audit('go_to_place', args, False, detail)
         return {'error': f'{place}로 가는 중 문제: {detail}'}
 
+    def _nearest_door(self, max_dist=1.35, state=None):
+        doors = getattr(self.node, 'doors_info', {}) or {}
+        pos = self.node.odom
+        if pos is None:
+            return None
+        best = None
+        for name, d in doors.items():
+            if state and d.get('state') != state:
+                continue
+            dist = math.hypot(d['x'] - pos[0], d['y'] - pos[1])
+            if dist < max_dist and (best is None or dist < best[0]):
+                best = (dist, name, d)
+        return best
+
+    def _try_open_door(self):
+        """닫힌 문이 1.4m 내면 열고 True — 내비 실패 시 자동 재시도용."""
+        hit = self._nearest_door(max_dist=1.4, state='closed')
+        if hit is None:
+            return False
+        self.pub_door.publish(String(data='open'))
+        self.node.notify_event(f'닫힌 문({hit[1]}) 발견 — 열고 계속 진행')
+        time.sleep(1.3)
+        return True
+
+    def open_door(self):
+        if ROBOT_TARGET == 'real':
+            return {'error': '실기 문 조작은 매니퓰레이션 필요 — 미지원'}
+        hit = self._nearest_door(max_dist=1.35)
+        if hit is None:
+            return {'error': '근처(1.35m)에 문이 없음 — 문 앞까지 이동 필요'}
+        self.pub_door.publish(String(data='open'))
+        time.sleep(1.3)
+        self.audit('open_door', {'door': hit[1]}, True, 'open')
+        return {'ok': f'{hit[1]} 문을 열었음 — 이제 지나갈 수 있음'}
+
+    def close_door(self):
+        if ROBOT_TARGET == 'real':
+            return {'error': '실기 문 조작은 매니퓰레이션 필요 — 미지원'}
+        hit = self._nearest_door(max_dist=1.35)
+        if hit is None:
+            return {'error': '근처(1.35m)에 문이 없음'}
+        self.pub_door.publish(String(data='close'))
+        time.sleep(1.3)
+        self.audit('close_door', {'door': hit[1]}, True, 'closed')
+        return {'ok': f'{hit[1]} 문을 닫았음'}
+
     def forget_map(self):
         """현재 탐색 월드의 학습 기억을 전부 삭제 — '둘러봐 이전'으로.
 
@@ -829,6 +904,7 @@ class ToolExecutor:
             # 중간 웨이포인트는 느슨하게 통과(0.5m), 최종 목적지만 정밀(0.35m)
             radius = 0.35 if i == n_wp - 1 else 0.5
             retried = 0
+            door_tried = False
             best_err = None
             while True:
                 if self._stop_requested:
@@ -868,6 +944,13 @@ class ToolExecutor:
                         msg.lateral_velocity = 0.0
                         self.pub_vel.publish(msg)
                         retried += 1
+                        best, best_t = None, time.monotonic()
+                        best_err = None
+                        continue
+                    if not door_tried and self._try_open_door():
+                        # 닫힌 문에 막힌 것 — 열고 같은 웨이포인트 재시도
+                        door_tried = True
+                        retried = 0
                         best, best_t = None, time.monotonic()
                         best_err = None
                         continue

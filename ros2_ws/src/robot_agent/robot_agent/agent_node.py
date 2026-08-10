@@ -87,10 +87,13 @@ class AgentNode(Node):
         self.objects = {}
         self.landmarks = {}
 
+        self.doors_info = {}
+
         def _on_objects(m):
             d = _json.loads(m.data)
             self.objects = d.get('objects', {})
             self.landmarks = d.get('landmarks', {})
+            self.doors_info = d.get('doors', {})
 
         self.carrying = ''
         self.create_subscription(
@@ -205,6 +208,15 @@ class AgentNode(Node):
                 nearby[name] = round(d, 2)
             st['nearby_objects_dist_m'] = dict(
                 sorted(nearby.items(), key=lambda kv: kv[1]))
+        if self.doors_info and self.odom:
+            rx, ry = self.odom
+            dv = {}
+            for name, p in self.doors_info.items():
+                dv[name] = {'dist_m': round(
+                    math.hypot(p['x'] - rx, p['y'] - ry), 2),
+                    'state': p.get('state')}
+            st['doors'] = dict(sorted(
+                dv.items(), key=lambda kv: kv[1]['dist_m']))
         if self.landmarks and self.odom:
             rx, ry = self.odom
             lm = {}
