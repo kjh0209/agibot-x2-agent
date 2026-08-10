@@ -890,18 +890,29 @@ class ToolExecutor:
                 p = (tx + r * math.cos(a), ty + r * math.sin(a))
                 if self._cost_pen(*p) <= 0.0:
                     cands.append(p)
-        cands.sort(key=d_robot)
         if not cands:
             msg = f'{object_name} 주변에 설 수 있는 자리가 없음'
             self.audit('go_to_object', args, False, msg)
             return {'error': msg}
+        # ★모든 후보의 A* 경로를 먼저 계산(ms 단위)해 최단 경로부터
+        # 시도 — '로봇과 가까운 후보'가 경로상으론 멀거나 막혀 있어
+        # 45초씩 낭비하던 것 제거 (110s → 보행시간 수준으로)
         t0 = time.monotonic()
-        arrived = None
-        for cand in cands[:3]:
-            wps = self._plan_path(pos, cand)   # 코스트맵 A*
+        planned = []
+        for cand in cands[:10]:
+            wps = self._plan_path(pos, cand)
             if wps is None:
                 continue
-            ok, detail = self._navigate(wps, timeout=90.0)
+            plen = math.hypot(wps[0][0] - pos[0], wps[0][1] - pos[1])
+            for i in range(1, len(wps)):
+                plen += math.hypot(wps[i][0] - wps[i - 1][0],
+                                   wps[i][1] - wps[i - 1][1])
+            planned.append((plen, cand, wps))
+        planned.sort(key=lambda t: t[0])
+        arrived = None
+        for plen, cand, wps in planned[:3]:
+            ok, detail = self._navigate(
+                wps, timeout=max(40.0, plen / 0.15))
             if ok:
                 arrived = cand
                 break
