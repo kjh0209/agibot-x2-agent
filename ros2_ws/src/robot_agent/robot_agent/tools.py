@@ -760,6 +760,26 @@ class ToolExecutor:
         self.audit('go_to_place', args, False, detail)
         return {'error': f'{place}로 가는 중 문제: {detail}'}
 
+    def forget_map(self):
+        """현재 탐색 월드의 학습 기억을 전부 삭제 — '둘러봐 이전'으로.
+
+        탐색 품질을 백지에서 판정하고 싶을 때 사용 (UI 🧠 버튼과 동일).
+        파일 삭제 + 메모리 캐시 제거를 함께 해야 진짜 백지가 된다."""
+        from x2_sim.worlds import WORLDS
+        world = self.node.current_world
+        if not WORLDS.get(world, {}).get('explore'):
+            return {'error': '이 공간은 학습 지도를 쓰지 않음 (탐색 모드 전용)'}
+        self.stop()                          # 진행 중 탐색이 있으면 중단
+        if hasattr(self, '_learned_cache'):
+            self._learned_cache.pop(world, None)
+        try:
+            os.remove(f'/ws/log/learned/{world}.json')
+        except FileNotFoundError:
+            pass
+        self.audit('forget_map', {'world': world}, True, 'wiped')
+        return {'ok': (f'{world}에 대한 기억을 전부 지웠음 — 이제 이 '
+                       f'공간은 처음 보는 곳. explore로 다시 배울 수 있음')}
+
     def remember_place(self, name: str):
         """사용자가 알려준 이름으로 현재 위치를 장소로 저장 (최소 교육)."""
         from x2_sim.worlds import WORLDS

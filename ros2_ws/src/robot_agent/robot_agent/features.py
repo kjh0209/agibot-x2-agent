@@ -51,10 +51,13 @@ FEATURES = {
     # 눕기 — 실기 v1 제외 (낙상 유사 자세라 안전 검토 필요)
     'lie_down':       {'kind': 'tool', 'tier': 'real_needs_work',
                        'real_available': False},
+    'forget_map':     {'kind': 'tool', 'tier': 'real_needs_work',
+                       'real_available': False},
 
     # ---------- UI ----------
-    'world_switch': {'kind': 'ui', 'tier': 'sim_only'},   # 🌍 드롭다운
-    'sim_reset':    {'kind': 'ui', 'tier': 'sim_only'},   # 🔄 리셋 버튼
+    'world_switch':  {'kind': 'ui', 'tier': 'sim_only'},  # 🌍 드롭다운
+    'sim_reset':     {'kind': 'ui', 'tier': 'sim_only'},  # 🔄 리셋 버튼
+    'memory_forget': {'kind': 'ui', 'tier': 'sim_only'},  # 🧠 기억 삭제
 
     # ---------- 내부 동작 (문서화 + 점검용) ----------
     'collision_block': {'kind': 'internal', 'tier': 'sim_only'},

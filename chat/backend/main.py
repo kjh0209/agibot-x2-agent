@@ -70,6 +70,8 @@ class Bridge(Node):
             McLocomotionVelocity, '/aima/mc/locomotion/velocity', 10)
         self.pub_hard_stop = self.create_publisher(
             String, '/agent/hard_stop', 10)
+        self.pub_forget = self.create_publisher(
+            String, '/agent/forget_map', 10)
         self.reset_cli = self.create_client(Trigger, '/x2_sim/reset')
         # 월드 전환 (latched 구독으로 현재 월드 추적)
         from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -238,6 +240,18 @@ async def status():
 async def stop():
     bridge.hard_stop()
     return Response('정지 발행 완료 (LLM 독립 경로)', media_type='text/plain')
+
+
+@app.post('/forget')
+async def forget():
+    """🧠 기억 삭제 — 학습 지도 삭제(에이전트) + 시뮬 초기화.
+    '둘러봐 이전'의 완전 미지 상태로 되돌린다."""
+    bridge.pub_forget.publish(String(data='ui_button'))
+    ok, msg = bridge.call_reset()
+    return Response(
+        '🧠 이 공간에 대한 기억 삭제 + 시뮬 초기화 — 이제 처음 보는 곳'
+        if ok else f'기억 삭제 발행됨, 시뮬 초기화는 실패: {msg}',
+        media_type='text/plain')
 
 
 @app.get('/features')

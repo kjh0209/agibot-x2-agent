@@ -115,6 +115,16 @@ document.getElementById('btn-stop').addEventListener('click', () => {
       setTimeout(() => (ctlMsg.textContent = ''), 3000);
     });
 });
+document.getElementById('btn-forget').addEventListener('click', () => {
+  if (!confirm('이 공간에 대한 로봇의 학습 기억(장소·길·물체)을 전부 지우고\n"둘러봐 이전"의 미지 상태로 되돌립니다. 계속할까요?')) return;
+  ctlMsg.textContent = '기억 삭제 중…';
+  fetch('/forget', { method: 'POST' })
+    .then(r => r.text()).then(t => {
+      ctlMsg.textContent = t;
+      addMsg('sys', t);
+      setTimeout(() => (ctlMsg.textContent = ''), 4000);
+    });
+});
 document.getElementById('btn-reset').addEventListener('click', () => {
   ctlMsg.textContent = '초기화 중…';
   fetch('/reset', { method: 'POST' })
@@ -135,6 +145,10 @@ fetch('/features').then(r => r.json()).then(f => {
   }
   if (!f.ui.sim_reset) {
     const el = document.getElementById('btn-reset');
+    if (el) el.style.display = 'none';
+  }
+  if (!f.ui.memory_forget) {
+    const el = document.getElementById('btn-forget');
     if (el) el.style.display = 'none';
   }
 }).catch(() => {});

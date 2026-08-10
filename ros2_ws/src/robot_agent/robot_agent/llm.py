@@ -209,6 +209,14 @@ ALL_TOOLS = [
         },
     },
     {
+        'name': 'forget_map',
+        'description': ('현재 탐색 공간에 대한 학습 기억(장소/길/물체)을 '
+                        '전부 지운다 — 처음 보는 공간 상태로 되돌리기. '
+                        '사용자가 명시적으로 "기억 지워/까먹어/리셋해"라고 '
+                        '할 때만 사용.'),
+        'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
         'name': 'remember_place',
         'description': ('현재 위치를 이름으로 기억한다. 탐색 모드 공간에서 '
                         '사용자가 "여기가 ~야"라고 알려줄 때 사용.'),

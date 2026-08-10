@@ -94,6 +94,10 @@ class AgentNode(Node):
             String, '/x2_sim/carrying',
             lambda m: setattr(self, 'carrying', m.data), latched3)
 
+        # 🧠 기억 삭제 (UI 버튼 하드와이어 경로 — LLM 무경유)
+        self.create_subscription(
+            String, '/agent/forget_map', self._on_forget_map, 10)
+
         # ---------- 출력 ----------
         self.pub_reply = self.create_publisher(String, '/agent/reply', 10)
         self.pub_event = self.create_publisher(String, '/agent/event', 10)
@@ -128,6 +132,13 @@ class AgentNode(Node):
     def on_pmu(self, msg: PmuState):
         frac = (msg.battery_voltage - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V)
         self.battery_pct = round(max(0.0, min(1.0, frac)) * 100)
+
+    def _on_forget_map(self, msg: String):
+        try:
+            r = self.executor_tools.forget_map()
+            self.notify_event(r.get('ok') or r.get('error') or str(r))
+        except Exception as e:
+            self.notify_event(f'기억 삭제 실패: {e}')
 
     def notify_event(self, text: str):
         """툴의 비동기 완료 통지 → UI 이벤트로 전달."""
