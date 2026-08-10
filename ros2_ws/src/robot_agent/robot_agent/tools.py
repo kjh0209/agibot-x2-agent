@@ -744,6 +744,7 @@ class ToolExecutor:
             return {'error': str(e)}
         duration_s = max(30.0, min(300.0, float(duration_s)))
         self._stop_requested = False
+        self._explore_opened = set()   # 이 라운드에 열어본 문
         lm = self._learned(world)
         blocked = set()
         t_end = time.monotonic() + duration_s
@@ -754,11 +755,29 @@ class ToolExecutor:
                 break
             cell = self._cell(*pos)
             lm['cells'].add(cell)
-            # 근처 문 학습 (탐색이 문 존재·상태까지 파악)
+            # 근처 문 학습 + ★호기심: 닫힌 문이 보이면 다가가 열어본다
+            # (문 너머는 미탐색 공간일 확률이 높다 — "문 보이면 열어보기")
+            if not hasattr(self, '_explore_opened'):
+                self._explore_opened = set()
             for dn, dd in (getattr(self.node, 'doors_info', {}) or {}).items():
-                if math.hypot(dd['x'] - pos[0], dd['y'] - pos[1]) < 2.5:
+                ddist = math.hypot(dd['x'] - pos[0], dd['y'] - pos[1])
+                if ddist < 2.5:
                     lm.setdefault('doors', {})[dn] = {
                         'x': dd['x'], 'y': dd['y']}
+                if (dd.get('state') == 'closed' and ddist < 2.5
+                        and dn not in self._explore_opened):
+                    self._explore_opened.add(dn)
+                    ux = (pos[0] - dd['x']) / max(ddist, 0.1)
+                    uy = (pos[1] - dd['y']) / max(ddist, 0.1)
+                    front = (dd['x'] + 0.85 * ux, dd['y'] + 0.85 * uy)
+                    wps = self._plan_path(pos, front) or [front]
+                    ok, _ = self._navigate(wps, timeout=25.0)
+                    if ok or ddist < 1.35:
+                        self.pub_door.publish(String(data='open'))
+                        self.node.notify_event(
+                            f'탐색: 닫힌 문({dn}) 발견 — 열어봄')
+                        time.sleep(1.3)
+                    continue
             if last_scan is None or (abs(cell[0] - last_scan[0])
                                      + abs(cell[1] - last_scan[1])) >= 3:
                 self._scan_and_register(lm, world)
@@ -1131,6 +1150,15 @@ class ToolExecutor:
                 elif best_err is None or _e < best_err - 0.05:
                     best_err, best_t = _e, time.monotonic()
                 elif time.monotonic() - best_t > 5.0:
+                    # ★막히면 제일 먼저 '닫힌 문인가?' 확인 — 종전엔
+                    # 후진/좌/우 사다리(~20s) 끝에서만 문을 열어서,
+                    # 탐색의 짧은 스텝 타임아웃(12s)이 그 전에 끊겼음
+                    if not door_tried and self._try_open_door():
+                        door_tried = True
+                        retried = 0
+                        best, best_t = None, time.monotonic()
+                        best_err = None
+                        continue
                     if retried < 3:
                         # 언스턱 3단: ①후진 1.5s ②좌측 이동 1.2s
                         # ③우측 이동 2.0s(좌측 복귀분 포함) — 문틀이
