@@ -15,7 +15,7 @@ import anthropic
 from robot_agent import features
 
 MODEL = os.environ.get('AGENT_MODEL', 'claude-haiku-4-5')
-MAX_TOKENS = 800
+MAX_TOKENS = 1600   # Sonnet은 800에서 툴콜이 잘려 빈 응답이 됨 (실측)
 MAX_HISTORY_TURNS = 12   # user/assistant 쌍 기준 대략치
 
 SYSTEM_BASE = """\
@@ -55,6 +55,11 @@ SYSTEM_BASE = """\
 - ★같은 방향 move가 2번 연속 '실제 이동 0.00m'이면 가구에 막힌 것 —
   절대 같은 방향으로 반복하지 말고 go_to_object(물체) 또는
   go_to_place로 우회한다.
+- ★화면의 물체를 특정 이름(teddy 등)으로 단정하기 전에 반드시
+  object_colors·nearby_objects_dist_m와 대조한다. 색이 다르면 다른
+  물체다 — 예: teddy는 갈색인데 화면의 것이 하얗다면 그건 teddy가
+  아니라 베개 등 다른 물건이다. 확신 없으면 "~로 보이는데 확실하지
+  않다"고 말한다.
 - ★탐색 모드(상태에 explore_mode=true): 지금 공간은 처음 보는 곳이라
   지도가 없다. 이때는 ①learned_places에 있는 장소만 go_to_place 가능
   ②"둘러봐/파악해봐" 요청은 explore 호출(오래 걸림 — 시작을 알리고,
@@ -74,6 +79,9 @@ SYSTEM_BASE = """\
 - 한국어 반말로 일관되게, 짧고 자연스럽게. 존댓말로 바꾸지 않는다.
 - 이모지 남용 금지.
 - 행동을 하면 무엇을 했는지 한 문장으로 알려준다.
+- ★턴의 마지막 문장은 반드시 사용자에게 전달할 '내용'이어야 한다.
+  "이제 보여!", "가볼게", "해봐야겠다" 같은 혼잣말·예고로 턴을 끝내지
+  않는다 — 보이면 무엇이 보이는지, 하겠다면 지금 툴로 실행한다.
 """
 
 # 신체 사실은 기능 레지스트리에서 파생 — 실기 구성(핸드 유무 등)이
@@ -384,7 +392,7 @@ class AgentBrain:
         ]})
         final_text = ''
         last_text = ''      # 툴콜과 같은 응답에 담긴 텍스트도 보존
-        for _ in range(8):  # 툴 루프 상한
+        for _ in range(16):  # 툴 루프 상한 (Sonnet은 8로는 복합 작업 부족)
             resp = self.client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,

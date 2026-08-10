@@ -748,13 +748,37 @@ class X2SimNode(Node):
         'studio_table': 'studio_table',
     }
 
+    @staticmethod
+    def _color_name(rgba):
+        """rgba → 대략적 한국어 색명 (LLM의 시각 대조용 데이터)."""
+        r, g, b = float(rgba[0]), float(rgba[1]), float(rgba[2])
+        if r > 0.8 and g > 0.8 and b > 0.8:
+            return '하양'
+        if r < 0.25 and g < 0.25 and b < 0.25:
+            return '검정'
+        if r > 0.6 and g < 0.4 and b < 0.4:
+            return '빨강'
+        if r > 0.75 and g > 0.45 and b < 0.35:
+            return '주황'
+        if r > 0.75 and g > 0.7 and b < 0.4:
+            return '노랑'
+        if g > 0.4 and r < 0.4 and b < 0.45:
+            return '초록'
+        if b > 0.5 and r < 0.45:
+            return '파랑'
+        if r > 0.4 and g > 0.25 and b < 0.35:
+            return '갈색'
+        return '회색'
+
     def publish_objects(self):
         objs = {}
         for name, info in self.graspables.items():
             p = self.data.xpos[info['bid']]
             objs[name] = {'x': round(float(p[0]), 2),
                           'y': round(float(p[1]), 2),
-                          'z': round(float(p[2]), 2)}
+                          'z': round(float(p[2]), 2),
+                          'color': self._color_name(
+                              self.model.geom_rgba[info['gid']])}
         lands = {}
         for prop, friendly in self.LANDMARKS.items():
             gid = mujoco.mj_name2id(

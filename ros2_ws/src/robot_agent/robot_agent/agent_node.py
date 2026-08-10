@@ -216,6 +216,11 @@ class AgentNode(Node):
                 nearby[name] = round(d, 2)
             st['nearby_objects_dist_m'] = dict(
                 sorted(nearby.items(), key=lambda kv: kv[1]))
+            # 물체 색상 — 화면의 물체를 이름으로 단정하기 전 대조용
+            # (하얀 베개를 갈색 teddy라고 우기던 confabulation 차단 데이터)
+            st['object_colors'] = {
+                n: p.get('color') for n, p in self.objects.items()
+                if n in nearby and p.get('color')}
         if self.doors_info and self.odom:
             rx, ry = self.odom
             dv = {}
