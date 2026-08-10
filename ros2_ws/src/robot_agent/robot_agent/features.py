@@ -44,6 +44,8 @@ FEATURES = {
     # SLAM 맵핑 + NaviPoint 연결(Phase 6.5) 전까지 real에서 숨김.
     'go_to_place': {'kind': 'tool', 'tier': 'real_needs_work',
                     'real_available': False},
+    'go_to_object': {'kind': 'tool', 'tier': 'real_needs_work',
+                     'real_available': False},
     # 미지 공간 탐색·학습 — 실기는 SLAM 자율 탐색으로 재구현 (Phase 6.5+)
     'explore':        {'kind': 'tool', 'tier': 'real_needs_work',
                        'real_available': False},

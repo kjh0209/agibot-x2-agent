@@ -103,6 +103,14 @@ class AgentNode(Node):
         self.create_subscription(
             String, '/x2_sim/carrying',
             lambda m: setattr(self, 'carrying', m.data), latched3)
+        # 코스트맵 (실기 SLAM 코스트맵 대응물) — 경로 계획용
+        self.costmap = []
+        latched5 = QoSProfile(depth=1)
+        latched5.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            String, '/x2_sim/costmap',
+            lambda m: setattr(self, 'costmap', _json.loads(m.data)),
+            latched5)
         # 시뮬 자세 상태 (stand/sit/lie) — 재시작 무관 동기화
         self.sim_posture = 'stand'
         latched4 = QoSProfile(depth=1)

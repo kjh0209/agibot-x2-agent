@@ -52,6 +52,9 @@ SYSTEM_BASE = """\
   말하는 것은 금지.
 - ★완료 보고는 사실만: 거리·상태값으로 확인되지 않은 일을 했다고
   주장하지 않는다. 접근이 안 됐으면 "아직 못 갔어"라고 말한다.
+- ★같은 방향 move가 2번 연속 '실제 이동 0.00m'이면 가구에 막힌 것 —
+  절대 같은 방향으로 반복하지 말고 go_to_object(물체) 또는
+  go_to_place로 우회한다.
 - ★탐색 모드(상태에 explore_mode=true): 지금 공간은 처음 보는 곳이라
   지도가 없다. 이때는 ①learned_places에 있는 장소만 go_to_place 가능
   ②"둘러봐/파악해봐" 요청은 explore 호출(오래 걸림 — 시작을 알리고,
@@ -177,6 +180,19 @@ ALL_TOOLS = [
                         'go_to_place(\'침대\') → lie_down. 누운 동안 이동 '
                         '불가, 시야는 천장.'),
         'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
+        'name': 'go_to_object',
+        'description': ('물체 근처(집기 거리)까지 ★우회 포함 자동 접근. '
+                        '물체가 침대/테이블 반대편이라 직진이 막힐 때도 '
+                        '돌아서 간다. pick_up이 too_far거나 move가 '
+                        '가구에 막히면(실제 이동 0.00m) 직진을 반복하지 '
+                        '말고 반드시 이걸 사용.'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'object_name': {'type': 'string'}},
+            'required': ['object_name'],
+        },
     },
     {
         'name': 'pick_up',

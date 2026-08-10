@@ -784,6 +784,144 @@ class ToolExecutor:
         self.audit('explore', args, True, summary)
         return {'ok': summary}
 
+    def _cost_pen(self, x, y):
+        """코스트맵(실기 SLAM 코스트맵 대응물) 기준 (x,y)의 관통량."""
+        worst = 0.0
+        for (cx, cy, hx, hy, margin) in getattr(self.node, 'costmap', []):
+            dx = max(0.0, abs(x - cx) - hx)
+            dy = max(0.0, abs(y - cy) - hy)
+            pen = margin - math.hypot(dx, dy)
+            if pen > worst:
+                worst = pen
+        return worst
+
+    def _plan_path(self, start, goal, res=0.2):
+        """코스트맵 A*(4방향, 0.2m 격자) — 자유 셀만 밟는 경로.
+
+        실기에서는 Nav2/NaviPoint가 하는 일의 시뮬 대응물."""
+        from heapq import heappush, heappop
+        sx, sy = start
+        gx, gy = goal
+
+        def cell(x, y):
+            return (round(x / res), round(y / res))
+
+        def free(c):
+            return self._cost_pen(c[0] * res, c[1] * res) <= 0.0
+
+        s, g = cell(sx, sy), cell(gx, gy)
+        if not free(g):
+            return None
+        openq = [(0.0, s)]
+        came = {s: None}
+        cost = {s: 0.0}
+        it = 0
+        while openq and it < 20000:
+            it += 1
+            _, cur = heappop(openq)
+            if cur == g:
+                path = [cur]
+                while came[path[-1]] is not None:
+                    path.append(came[path[-1]])
+                path.reverse()
+                wps = [(c[0] * res, c[1] * res) for c in path[2::3]]
+                wps.append((gx, gy))
+                return wps
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nxt = (cur[0] + dx, cur[1] + dy)
+                if nxt in cost or not free(nxt):
+                    continue
+                cost[nxt] = cost[cur] + res
+                came[nxt] = cur
+                heappush(openq, (cost[nxt]
+                                 + math.hypot(nxt[0] - g[0], nxt[1] - g[1])
+                                 * res, nxt))
+        return None
+
+    def _route_to_point(self, tx, ty):
+        """목표점까지의 웨이포인트 — 탐색 월드면 가본 셀 BFS 경유."""
+        from x2_sim.worlds import WORLDS
+        pos = self.node.odom or (0.0, 0.0)
+        if not WORLDS.get(self.node.current_world, {}).get('explore'):
+            return [(tx, ty)]
+        lm = self._learned(self.node.current_world)
+        cells = set(lm['cells'])
+        if not cells:
+            return [(tx, ty)]
+        start_c = self._cell(*pos)
+        cells.add(start_c)
+        goal_c = self._cell(tx, ty)
+        if goal_c not in cells:
+            goal_c = min(cells, key=lambda c: (c[0] - goal_c[0]) ** 2
+                         + (c[1] - goal_c[1]) ** 2)
+        path = self._bfs_cells(cells, start_c, goal_c)
+        wps = []
+        if path:
+            wps = [(c[0] * self.CELL, c[1] * self.CELL) for c in path[1:]]
+        wps.append((tx, ty))
+        return wps
+
+    def go_to_object(self, object_name: str):
+        """물체 근처(집기 가능 거리)까지 ★우회 포함 접근.
+
+        배경: 물체가 가구(침대 등) 반대편에 있으면 LLM이 직진 move만
+        반복하며 막힘 — 접근점 후보(물체 주위 링)로 가고, 직행이
+        막히면 물체를 빙 도는 경유점(도그레그)으로 우회한다. 특정
+        가구/월드 지식 없이 동작하는 범용 탐색."""
+        args = {'object_name': object_name}
+        obj = self.node.objects.get(object_name)
+        if obj is None:
+            msg = (f'{object_name!r} 위치를 모름 — 근처에서 감지된 적 '
+                   f'없음. 탐색이나 접근이 먼저 필요')
+            self.audit('go_to_object', args, False, msg)
+            return {'error': msg}
+        tx, ty = obj['x'], obj['y']
+        pos = self.node.odom or (0.0, 0.0)
+
+        def d_robot(p):
+            return math.hypot(p[0] - pos[0], p[1] - pos[1])
+
+        # 접근점 후보: 물체 주위 0.55~0.8m 링 중 ★코스트맵상 자유 지점만
+        # (가구 발자국 안 후보에 45초씩 낭비하던 실측 사고 방지)
+        cands = []
+        for r in (0.55, 0.7, 0.85):
+            for k in range(12):
+                a = k * math.pi / 6
+                p = (tx + r * math.cos(a), ty + r * math.sin(a))
+                if self._cost_pen(*p) <= 0.0:
+                    cands.append(p)
+        cands.sort(key=d_robot)
+        if not cands:
+            msg = f'{object_name} 주변에 설 수 있는 자리가 없음'
+            self.audit('go_to_object', args, False, msg)
+            return {'error': msg}
+        t0 = time.monotonic()
+        arrived = None
+        for cand in cands[:3]:
+            wps = self._plan_path(pos, cand)   # 코스트맵 A*
+            if wps is None:
+                continue
+            ok, detail = self._navigate(wps, timeout=90.0)
+            if ok:
+                arrived = cand
+                break
+            if 'stop' in detail:
+                return {'error': 'stop 요청으로 중단'}
+        if arrived is None:
+            msg = (f'{object_name} 주변 접근로를 못 찾음 — 경로가 전부 '
+                   f'막혀 있음. 문이 닫혀 있거나 통로가 없는 듯')
+            self.audit('go_to_object', args, False, msg)
+            return {'error': msg}
+        # 물체를 바라보게 정렬
+        p2 = self.node.odom or arrived
+        self._rotate_to(math.atan2(ty - p2[1], tx - p2[0]))
+        d = math.hypot(tx - p2[0], ty - p2[1])
+        took = time.monotonic() - t0
+        result = (f'{object_name} 근처 도착 — 거리 {d:.2f}m '
+                  f'({took:.0f}초). 0.95m 이내면 pick_up 가능')
+        self.audit('go_to_object', args, True, result)
+        return {'ok': result}
+
     def _go_to_learned(self, place, args):
         """탐색 모드: 배운 장소로, 가본 셀만 밟아 이동."""
         cur = self.node.current_world

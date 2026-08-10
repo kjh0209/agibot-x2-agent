@@ -282,6 +282,12 @@ class X2SimNode(Node):
         self.pub_posture_state = self.create_publisher(
             String, '/x2_sim/posture_state', _lat)
         self.pub_posture_state.publish(String(data=self.posture))
+        # 코스트맵 (경로 계획용 — 실기 SLAM 코스트맵 대응물)
+        _lat2 = QoSProfile(depth=1)
+        _lat2.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.pub_costmap = self.create_publisher(
+            String, '/x2_sim/costmap', _lat2)
+        self._rebuild_zones()   # 발행자 생성 후 1회 재구축·발행
         self.pub_carrying.publish(String(data=''))
         # 주변 물체 브로드캐스트 (에이전트 상태 주입용)
         self.pub_objects = self.create_publisher(
@@ -968,6 +974,13 @@ class X2SimNode(Node):
             margin = 0.30 if top >= 0.5 else 0.12
             self.block_zones.append(
                 (float(p[0]), float(p[1]), hx, hy, margin, top, name))
+        # 코스트맵 발행 — 실기의 SLAM 코스트맵 대응물 (로봇이 라이다로
+        # 실시간 구축하는 정보라 '지도 유출'이 아님). 에이전트의 경로
+        # 계획(A*)이 사용. latched: 문 토글 등 갱신 시마다 재발행.
+        if hasattr(self, 'pub_costmap'):
+            self.pub_costmap.publish(String(data=json.dumps(
+                [[z[0], z[1], z[2], z[3], z[4]]
+                 for z in self.block_zones])))
 
     def _set_door(self, name, state, rebuild=True):
         """문 상태 전환 — open: 문설주로 접힘(시각만)/closed: 통로 차단."""
