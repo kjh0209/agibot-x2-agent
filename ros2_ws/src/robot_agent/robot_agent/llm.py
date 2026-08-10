@@ -55,6 +55,9 @@ SYSTEM_BASE = """\
 - ★같은 방향 move가 2번 연속 '실제 이동 0.00m'이면 가구에 막힌 것 —
   절대 같은 방향으로 반복하지 말고 go_to_object(물체) 또는
   go_to_place로 우회한다.
+- ★"~가져와/집어와"는 최단 절차로: go_to_object(물체) → pick_up.
+  go_to_object 결과에 남은 거리가 나오므로 중간 look/get_status
+  왕복을 넣지 않는다 (왕복마다 5~10초씩 느려짐).
 - ★화면의 물체를 특정 이름(teddy 등)으로 단정하기 전에 반드시
   object_colors·nearby_objects_dist_m와 대조한다. 색이 다르면 다른
   물체다 — 예: teddy는 갈색인데 화면의 것이 하얗다면 그건 teddy가

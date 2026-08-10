@@ -691,18 +691,62 @@ class ToolExecutor:
         s = str(s).strip().split()[0] if str(s).strip() else ''
         return s[:10]
 
+    VLM_SCAN4_PROMPT = (
+        '실내 로봇이 제자리에서 90°씩 돌며 찍은 4방향 프레임이다. 단순 '
+        '도형 시뮬레이션이므로 색·형태·크기·배치로 추정하라. 4장을 함께 '
+        '보고 공간을 종합 판단하라.\n'
+        'JSON 배열만 출력(길이 4, 프레임 순서대로): '
+        '[{"room": "공간 종류 한 단어(모르면 \\"모름\\")", '
+        '"furniture": ["큰 가구/설비 한 단어씩"], '
+        '"objects": ["소형 물체 한 단어씩"]}, ...]\n'
+        '규칙: 명사 한 단어(예: 침대, 회의탁자, 정수기 — 예시일 뿐 '
+        '무엇이든 가능). 벽/바닥/문/천장 제외. 확실한 것만.')
+
     def _scan_and_register(self, lm, world):
-        """제자리 4방향 VLM 스캔 → 방/가구/물체 기록. 새 가구면 접근·등록."""
+        """제자리 4방향 스캔 — 프레임 4장 선촬영 후 ★VLM 1회 호출.
+
+        방향별 개별 호출(지점당 ~25s) 대비 빠르고, 4방향을 함께 보는
+        교차 맥락 덕에 공간 판단 품질도 좋아진다."""
         base_yaw = self.node.yaw_rad()
+        frames = []
         for k in range(4):
             if self._stop_requested:
                 return
             yaw = base_yaw + k * (math.pi / 2.0)
             self._rotate_to(yaw, timeout=7.0)
-            res = self._vlm_look()
-            if not res:
+            time.sleep(0.2)              # 최신 프리뷰 확보
+            f = getattr(self.node, 'latest_preview', None)
+            if f is not None:
+                frames.append((yaw, f))
+        if not frames:
+            return
+        try:
+            import anthropic
+            if not hasattr(self, '_vlm'):
+                self._vlm = anthropic.Anthropic()
+            content = []
+            for i, (yaw, f) in enumerate(frames):
+                content.append({'type': 'text', 'text': f'[프레임 {i + 1}]'})
+                content.append({'type': 'image', 'source': {
+                    'type': 'base64', 'media_type': 'image/jpeg',
+                    'data': base64.standard_b64encode(f).decode()}})
+            content.append({'type': 'text', 'text': self.VLM_SCAN4_PROMPT})
+            r = self._vlm.messages.create(
+                model='claude-haiku-4-5', max_tokens=500,
+                messages=[{'role': 'user', 'content': content}])
+            txt = ''.join(b.text for b in r.content if b.type == 'text')
+            txt = txt[txt.find('['):txt.rfind(']') + 1]
+            results = json.loads(txt)
+            self.audit('vlm_scan', {'frames': len(frames)}, True,
+                       json.dumps(results, ensure_ascii=False)[:300])
+        except Exception as e:
+            self.audit('vlm_scan', {'frames': len(frames)}, False, str(e))
+            return
+        pos = self.node.odom or (0.0, 0.0)
+        approach = None                  # (가구명, yaw) — 스캔 후 1건 접근
+        for (yaw, _f), res in zip(frames, results):
+            if not isinstance(res, dict):
                 continue
-            pos = self.node.odom or (0.0, 0.0)
             room = self._clean_label(res.get('room') or '모름')
             if room and room != '모름' and room not in lm['rooms']:
                 lm['rooms'][room] = [round(pos[0], 2), round(pos[1], 2)]
@@ -719,10 +763,10 @@ class ToolExecutor:
                 fname = self._clean_label(fname)
                 if fname in self.LABEL_BLACKLIST:
                     continue
-                if fname and fname not in lm['places']:
-                    self._approach_and_register(lm, fname, yaw)
-                    self._save_learned(world)
-                    return                 # 위치가 변했으니 스캔 종료
+                if fname and fname not in lm['places'] and approach is None:
+                    approach = (fname, yaw)
+        if approach is not None:
+            self._approach_and_register(lm, approach[0], approach[1])
         self._save_learned(world)
 
     def explore(self, duration_s: float = 180):
@@ -955,6 +999,12 @@ class ToolExecutor:
                                    wps[i][1] - wps[i - 1][1])
             planned.append((plen, cand, wps))
         planned.sort(key=lambda t: t[0])
+        self.audit('go_to_object_plan', args, True,
+                   f'costmap={len(getattr(self.node, "costmap", []))} '
+                   f'cands={len(cands)} planned={len(planned)} '
+                   f'best_len={planned[0][0]:.1f}' if planned else
+                   f'costmap={len(getattr(self.node, "costmap", []))} '
+                   f'cands={len(cands)} planned=0')
         arrived = None
         for plen, cand, wps in planned[:3]:
             ok, detail = self._navigate(
