@@ -150,7 +150,15 @@ ALL_TOOLS = [
     },
     {
         'name': 'stand_up',
-        'description': '앉은 상태에서 일어선다.',
+        'description': '앉거나 누운 상태에서 일어선다.',
+        'input_schema': {'type': 'object', 'properties': {}},
+    },
+    {
+        'name': 'lie_down',
+        'description': ('눕는다. 침대/소파 바로 앞(0.5m 내)에서 호출하면 '
+                        '그 위로 올라가 눕고, 아니면 바닥에 눕는다. '
+                        '"침대에 누워" 흐름: go_to_place(\'침대\') → '
+                        'lie_down. 누운 동안 이동 불가, 시야는 천장.'),
         'input_schema': {'type': 'object', 'properties': {}},
     },
     {

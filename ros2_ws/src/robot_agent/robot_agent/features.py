@@ -48,6 +48,9 @@ FEATURES = {
                        'real_available': False},
     'remember_place': {'kind': 'tool', 'tier': 'real_needs_work',
                        'real_available': False},
+    # 눕기 — 실기 v1 제외 (낙상 유사 자세라 안전 검토 필요)
+    'lie_down':       {'kind': 'tool', 'tier': 'real_needs_work',
+                       'real_available': False},
 
     # ---------- UI ----------
     'world_switch': {'kind': 'ui', 'tier': 'sim_only'},   # 🌍 드롭다운

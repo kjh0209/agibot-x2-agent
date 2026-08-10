@@ -93,6 +93,10 @@ class ToolExecutor:
         # look() 온디맨드 고해상 렌더 요청 (시뮬 전용 — 실기는 상시 스트림)
         self.pub_render_hq = node.create_publisher(
             String, '/x2_sim/render_hq', 1)
+        # 자세 직접 전환 (눕기 — 시뮬 전용)
+        self.pub_posture = node.create_publisher(
+            String, '/x2_sim/posture', 10)
+        self._lying = False
         # 집기/놓기 (시뮬 전용 — 실기는 핸드 하드웨어 + HandCommand)
         self.pub_grasp = node.create_publisher(String, '/x2_sim/grasp', 10)
         self.pub_release = node.create_publisher(
@@ -210,6 +214,8 @@ class ToolExecutor:
             st['mode'] = ACTION_NAMES.get(self.current_action(), '?')
         except RuntimeError as e:
             st['mode'] = f'조회 실패: {e}'
+        if self._lying:
+            st['posture'] = 'lying (누움 — upright=false 정상, 이동 불가)'
         # 탐색 모드(미지 공간): 지도 사전 지식을 주지 않는다 —
         # 물체는 2m 근접에서만 감지되고, 장소는 학습한 것만 노출
         from x2_sim.worlds import WORLDS as _W
@@ -469,15 +475,17 @@ class ToolExecutor:
     # remember_place(보정용)로 최소화. 실기에서는 SLAM 탐색으로 대체.
     CELL = 0.8
 
+    # ★개방 어휘 — 후보 목록 제한 없음. 어떤 공간(집/사무실/카페 등)이든
+    # VLM이 보이는 대로 명명한다. 예시는 형식 안내일 뿐 제한이 아님.
     VLM_SCAN_PROMPT = (
         '실내를 다니는 로봇의 카메라 프레임이다. 단순 도형으로 만든 '
-        '시뮬레이션이므로 색·형태·배치로 추정하라.\n'
-        '다음 JSON만 출력: {"room": "침실|서재|거실|주방|복도|모름", '
-        '"furniture": [...], "objects": [...]}\n'
-        'furniture 후보: 침대, 옷장, 책장, 책상, 의자, 소파, 안락의자, '
-        '테이블, 화분, 티비\n'
-        'objects 후보: 공, 컵, 인형, 책, 과일, 병\n'
-        '화면 중앙 근처에 확실히 보이는 것만. 없으면 빈 배열.')
+        '시뮬레이션이므로 색·형태·크기·배치로 추정하라.\n'
+        '다음 JSON만 출력: {"room": "이 공간의 종류를 한 단어로 '
+        '(모르면 \\"모름\\")", "furniture": ["보이는 큰 가구/설비 각각 '
+        '한 단어씩"], "objects": ["보이는 소형 물체 각각 한 단어씩"]}\n'
+        '규칙: 명사 한 단어로 통일(예: 침대, 회의탁자, 정수기, 세탁기, '
+        '노트북 — 어디까지나 예시이며 어떤 명사든 가능). 벽/바닥/문은 '
+        '제외. 확실한 것만. 없으면 빈 배열.')
 
     def _learned(self, world):
         if not hasattr(self, '_learned_cache'):
@@ -610,6 +618,12 @@ class ToolExecutor:
         self.node.notify_event(f'탐색: {name} 발견 → 장소로 기억함')
         self._dock(max_dist=0.5, forward=False)   # 물러나 탐색 재개
 
+    @staticmethod
+    def _clean_label(s):
+        """개방 어휘 라벨 살균 — 첫 단어만, 10자 상한."""
+        s = str(s).strip().split()[0] if str(s).strip() else ''
+        return s[:10]
+
     def _scan_and_register(self, lm, world):
         """제자리 4방향 VLM 스캔 → 방/가구/물체 기록. 새 가구면 접근·등록."""
         base_yaw = self.node.yaw_rad()
@@ -622,20 +636,20 @@ class ToolExecutor:
             if not res:
                 continue
             pos = self.node.odom or (0.0, 0.0)
-            room = str(res.get('room') or '모름')
-            if room != '모름' and room not in lm['rooms']:
+            room = self._clean_label(res.get('room') or '모름')
+            if room and room != '모름' and room not in lm['rooms']:
                 lm['rooms'][room] = [round(pos[0], 2), round(pos[1], 2)]
                 lm['places'].setdefault(
                     room, {'pos': [round(pos[0], 2), round(pos[1], 2)],
                            'yaw': round(yaw, 2)})
                 self.node.notify_event(f'탐색: 여기는 {room}인 것 같음')
             for o in (res.get('objects') or []):
-                o = str(o)
+                o = self._clean_label(o)
                 if o and o not in lm['objects_seen']:
                     lm['objects_seen'][o] = {
                         'near': [round(pos[0], 2), round(pos[1], 2)]}
             for fname in (res.get('furniture') or []):
-                fname = str(fname)
+                fname = self._clean_label(fname)
                 if fname and fname not in lm['places']:
                     self._approach_and_register(lm, fname, yaw)
                     self._save_learned(world)
@@ -1037,7 +1051,14 @@ class ToolExecutor:
         return {'ok': f'앉았음.{held} 앉은 동안 이동 불가 — stand_up으로 일어남'}
 
     def stand_up(self):
-        """일어서기 — 실기 McAction STAND_UP_DEFAULT(2005)."""
+        """일어서기 — 실기 McAction STAND_UP_DEFAULT(2005). 누운 상태
+        (시뮬 lie)에서는 자세 토픽으로 기립."""
+        if self._lying and ROBOT_TARGET == 'sim':
+            self.pub_posture.publish(String(data='stand'))
+            self._lying = False
+            time.sleep(1.8)             # 역글라이드+기립 램프 완료 대기
+            self.audit('stand_up', {}, True, 'stood from lie')
+            return {'ok': '누운 데서 일어나 침대/바닥에서 내려왔음'}
         try:
             self.ensure_source()
             self.set_action(int(McAction.STAND_UP_DEFAULT))
@@ -1046,6 +1067,24 @@ class ToolExecutor:
             return {'error': str(e) + ' (앉아있지 않으면 실패함)'}
         self.audit('stand_up', {}, True, 'standing')
         return {'ok': '일어섰음 (STAND_DEFAULT)'}
+
+    def lie_down(self):
+        """눕기 (시뮬 전용 자세) — 정면 0.55m 지점이 침대/소파처럼 낮은
+        가구면 그 위로 올라가 눕고, 아니면 바닥에 눕는다."""
+        if ROBOT_TARGET == 'real':
+            return {'error': '실기 눕기는 미지원 (실기 v1 제외 — 안전 검토 필요)'}
+        if self._lying:
+            return {'ok': '이미 누워 있음'}
+        if self.node.carrying:
+            return {'error': f'{self.node.carrying}을(를) 들고는 누울 수 '
+                             f'없음 — 먼저 put_down'}
+        self.pub_posture.publish(String(data='lie'))
+        self._lying = True
+        time.sleep(1.8)                 # 글라이드+눕기 램프 완료 대기
+        self.audit('lie_down', {}, True, 'lying')
+        return {'ok': ('누웠음 — 시야가 천장을 향한다. 누운 동안 이동 '
+                       '불가, stand_up으로 일어남. 누운 상태에서 '
+                       'upright=false는 정상')}
 
     def pick_up(self, object_name: str):
         args = {'object_name': object_name}

@@ -241,6 +241,10 @@ class X2SimNode(Node):
             String, '/x2_sim/grasp', self.on_grasp, 10)
         self.create_subscription(
             String, '/x2_sim/release', self.on_release, 10)
+        # 자세 직접 전환 (눕기 등 — MC 액션 체계 밖의 시뮬 전용 자세)
+        self.create_subscription(
+            String, '/x2_sim/posture',
+            lambda m: self.set_posture(m.data.strip()), 10)
         self.pub_carrying.publish(String(data=''))
         # 주변 물체 브로드캐스트 (에이전트 상태 주입용)
         self.pub_objects = self.create_publisher(
@@ -392,7 +396,18 @@ class X2SimNode(Node):
         self.batt_start_time = self.data.time
 
         self.posture = 'stand'
-        self._sit_blend = 0.0   # 0=서기, 1=앉기 — 1.2s 램프로 전환
+        # 일반화 자세 상태 — {z(절대), pitch(rad), joints{이름:오프셋}}를
+        # 1.5s smoothstep으로 보간. 글라이드(수평 이동)는 전환에 실어
+        # 침대 위로 오르내리기/소파에서 몸 빼기를 표현.
+        self._pose_cur = {'z': float(self.data.qpos[2]), 'pitch': 0.0,
+                          'joints': {}}
+        self._pose_from = {'z': self._pose_cur['z'], 'pitch': 0.0,
+                           'joints': {}}
+        self._pose_to = {'z': self._pose_cur['z'], 'pitch': 0.0,
+                         'joints': {}}
+        self._pose_t = 1.0
+        self._pose_glide = (0.0, 0.0)
+        self._lie_entry_glide = (0.0, 0.0)
         self.base_z0 = float(self.data.qpos[2])
         self.prop_gids = set()
         # ★이동 차단 = 기하 판정 (물리 접촉과 분리).
@@ -404,8 +419,9 @@ class X2SimNode(Node):
         # 작게(0.12m) 둬 도킹 밀착이 가능하고, 벽/장롱류는 0.30m.
         self.block_zones = []
         for name in prop_names:
-            # 바닥 오버레이/러그는 로봇이 밟고 서는 면 — 차단 대상 아님
-            if '_floor' in name or name == 'rug':
+            # 바닥/천장/러그는 통행면·머리 위 — 차단 대상 아님
+            # (천장을 2D 차단 구역에 넣으면 전 면적이 막힌다!)
+            if '_floor' in name or '_ceiling' in name or name == 'rug':
                 continue
             gid = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
@@ -423,7 +439,7 @@ class X2SimNode(Node):
                         mujoco.mjtGeom.mjGEOM_CYLINDER) else s[0])
                 margin = 0.30 if top >= 0.5 else 0.12
                 self.block_zones.append(
-                    (float(p[0]), float(p[1]), hx, hy, margin, name))
+                    (float(p[0]), float(p[1]), hx, hy, margin, top, name))
         self._contact_prev = False
         self._pen_last = 0.0
         self._blocked_logged = False
@@ -536,25 +552,61 @@ class X2SimNode(Node):
         vadr = info['qvel_adr']
         self.data.qvel[vadr:vadr + 6] = 0.0
 
-    def set_posture(self, posture: str):
-        """앉기/서기 자세 (McMock이 SIT_DOWN/STAND_UP 액션에서 호출).
+    SIT_JOINTS = {
+        'left_hip_pitch_joint': -1.35, 'right_hip_pitch_joint': -1.35,
+        'left_knee_joint': 1.5, 'right_knee_joint': 1.5,
+        'left_ankle_pitch_joint': -0.15, 'right_ankle_pitch_joint': -0.15,
+    }
 
-        즉시 점프가 아니라 _sit_blend 램프(1.2s)로 전환 —
-        베이스 높이를 한 프레임에 바꾸면 화면이 덜컹거림 (실측 제보)."""
+    def _platform_top(self, x, y):
+        """(x,y) 아래의 낮은 가구(침대/소파 등) 윗면 높이. 없으면 0."""
+        best = 0.0
+        for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
+            if top < 0.6 and abs(x - cx) <= hx + 0.05 \
+                    and abs(y - cy) <= hy + 0.05:
+                best = max(best, top)
+        return best
+
+    def set_posture(self, posture: str):
+        """자세 전환 (stand/sit/lie) — 즉시 점프가 아니라 1.5s 램프.
+
+        lie: 전방 0.55m 지점(침대/소파 위면 그 위, 아니면 바닥)으로
+        글라이드하며 등을 대고 눕는다(베이스 피치 -80°). 일어설 때는
+        역글라이드로 내려온다."""
+        if posture not in ('stand', 'sit', 'lie'):
+            return
+        yaw = self.base_yaw
+        c, s = math.cos(yaw), math.sin(yaw)
+        glide = (0.0, 0.0)
+        if posture == 'sit':
+            tgt = {'z': self.base_z0 - 0.23, 'pitch': 0.0,
+                   'joints': dict(self.SIT_JOINTS)}
+        elif posture == 'lie':
+            gx, gy = 0.55 * c, 0.55 * s
+            top = self._platform_top(self.base_xyz[0] + gx,
+                                     self.base_xyz[1] + gy)
+            tgt = {'z': top + 0.16, 'pitch': -1.40, 'joints': {}}
+            glide = (gx, gy)
+            self._lie_entry_glide = glide
+        else:
+            tgt = {'z': self.base_z0, 'pitch': 0.0, 'joints': {}}
+            if self.posture == 'lie':      # 눕던 자리에서 역글라이드
+                glide = (-self._lie_entry_glide[0],
+                         -self._lie_entry_glide[1])
+            elif self.posture == 'sit':    # 소파에서 반보 전진
+                glide = (0.18 * c, 0.18 * s)
+        self._pose_from = {'z': self._pose_cur['z'],
+                           'pitch': self._pose_cur['pitch'],
+                           'joints': dict(self._pose_cur['joints'])}
+        self._pose_to = tgt
+        self._pose_glide = glide
+        self._pose_t = 0.0
         self.posture = posture
-        self.get_logger().info(f'자세 전환 시작: {posture} (1.2s 램프)')
+        self.get_logger().info(f'자세 전환 시작: {posture} (1.5s 램프)')
 
     def posture_offsets(self):
-        b = self._sit_blend
-        if b < 0.01:
-            return None
-        s = b * b * (3.0 - 2.0 * b)   # smoothstep — 시작/끝이 부드럽게
-        off = {}
-        for side in ('left', 'right'):
-            off[f'{side}_hip_pitch_joint'] = -1.35 * s   # 허벅지 앞으로
-            off[f'{side}_knee_joint'] = 1.5 * s          # 무릎 굽힘
-            off[f'{side}_ankle_pitch_joint'] = -0.15 * s
-        return off
+        j = self._pose_cur['joints']
+        return dict(j) if j else None
 
     def carry_arm_offsets(self):
         """물건을 들고 있는 동안 오른팔 들기 자세."""
@@ -607,7 +659,11 @@ class X2SimNode(Node):
             self.cmd_time = 0.0
             self.motion = None
             self.posture = 'stand'
-            self._sit_blend = 0.0
+            self._pose_cur = {'z': float(self.data.qpos[2]), 'pitch': 0.0,
+                              'joints': {}}
+            self._pose_to = dict(self._pose_cur, joints={})
+            self._pose_t = 1.0
+            self._pose_glide = (0.0, 0.0)
             self.base_xyz = np.array(self.data.qpos[0:3])
             qw, qx, qy, qz = self.data.qpos[3:7]
             self.base_yaw = math.atan2(2 * (qw * qz + qx * qy),
@@ -738,7 +794,7 @@ class X2SimNode(Node):
                 if ai is not None:
                     q_target[ai] += delta
         kp, kd = self.kp, self.kd
-        if self._sit_blend > 0.05:
+        if self.posture != 'stand' or self._pose_t < 1.0:
             # 착석 중 허리/다리 강성 상향 — 소파 접촉력이 유연한(kp=120)
             # 관절을 밀어 카메라가 기울던 문제(허리 0.29rad 편차 실측).
             # 실기에서는 MC가 자체 자세 제어를 하므로 시뮬 전용 보정.
@@ -753,7 +809,7 @@ class X2SimNode(Node):
     def _zone_pen(self, x, y):
         """(x,y)에서 가구 차단 구역 관통량(최댓값). 0이면 자유 공간."""
         worst = 0.0
-        for (cx, cy, hx, hy, margin, name) in self.block_zones:
+        for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
             dx = abs(x - cx) - hx
             dy = abs(y - cy) - hy
             d = math.hypot(max(0.0, dx), max(0.0, dy))
@@ -772,26 +828,31 @@ class X2SimNode(Node):
         결과가 실기와 동일하므로 Phase 2~4 개발에 충분하다.
         """
         dt = self.model.opt.timestep
-        # 자세 램프: 앉기/서기를 1.2s에 걸쳐 부드럽게. 베이스 높이는
-        # smoothstep 보간, 일어설 때는 반보(0.18m) 전진 글라이드로
-        # 소파 지오메트리에서 몸을 빼 접촉 끼임(기울어짐·이동 차단)을
-        # 원천 회피.
-        target_b = 1.0 if self.posture == 'sit' else 0.0
-        if self._sit_blend != target_b:
-            prev_b = self._sit_blend
-            step = dt / 1.2
-            self._sit_blend = (min(target_b, prev_b + step)
-                               if target_b > prev_b
-                               else max(target_b, prev_b - step))
-            b = self._sit_blend
-            s = b * b * (3.0 - 2.0 * b)
-            self.base_xyz[2] = self.base_z0 - 0.23 * s
-            if target_b == 0.0:            # 일어서는 중 — 전진 글라이드
-                d = prev_b - self._sit_blend
-                self.base_xyz[0] += 0.18 * d * math.cos(self.base_yaw)
-                self.base_xyz[1] += 0.18 * d * math.sin(self.base_yaw)
+        # 자세 램프: 파라미터(z/pitch/관절/글라이드)를 1.5s smoothstep 보간
+        if self._pose_t < 1.0:
+            t0 = self._pose_t
+            s0 = t0 * t0 * (3.0 - 2.0 * t0)
+            self._pose_t = min(1.0, self._pose_t + dt / 1.5)
+            t1 = self._pose_t
+            s1 = t1 * t1 * (3.0 - 2.0 * t1)
+            f, tt = self._pose_from, self._pose_to
+            self._pose_cur['z'] = f['z'] + (tt['z'] - f['z']) * s1
+            self._pose_cur['pitch'] = (f['pitch']
+                                       + (tt['pitch'] - f['pitch']) * s1)
+            joints = {}
+            for k in set(f['joints']) | set(tt['joints']):
+                a = f['joints'].get(k, 0.0)
+                b2 = tt['joints'].get(k, 0.0)
+                joints[k] = a + (b2 - a) * s1
+            self._pose_cur['joints'] = joints
+            ds = s1 - s0
+            self.base_xyz[0] += self._pose_glide[0] * ds
+            self.base_xyz[1] += self._pose_glide[1] * ds
+            self.base_xyz[2] = self._pose_cur['z']
         fresh = self.data.time - self.cmd_time <= 0.5
         target = self.cmd_vel if fresh else np.zeros(3)
+        if self.posture == 'lie':
+            target = np.zeros(3)   # 누운 채 보행 불가 (일어나야 이동)
         # 가감속 램프(τ=0.25s) — 명령 속도를 즉시 적용하면 방향 전환마다
         # 카메라가 덜컹거림. 단 ★정지 명령(전부 0)은 즉시 반영 —
         # 정지의 즉시성(안전 이중 경로)은 부드러움보다 우선.
@@ -822,8 +883,15 @@ class X2SimNode(Node):
         moving = bool(self.vel_smooth.any())
         if self.hold_base:
             self.data.qpos[0:3] = self.base_xyz
-            half = self.base_yaw / 2.0
-            self.data.qpos[3:7] = (math.cos(half), 0.0, 0.0, math.sin(half))
+            # 자세 피치(눕기) 합성: R = Rz(yaw) · Ry(pitch)
+            hy = self.base_yaw / 2.0
+            hp = self._pose_cur['pitch'] / 2.0
+            cz, sz = math.cos(hy), math.sin(hy)
+            cp, sp = math.cos(hp), math.sin(hp)
+            self.data.qpos[3] = cz * cp
+            self.data.qpos[4] = -sz * sp
+            self.data.qpos[5] = cz * sp
+            self.data.qpos[6] = sz * cp
             self.data.qvel[0:6] = 0.0
             if moving:
                 # IMU 각속도/가속에 명령이 반영되게 수평 속도만 남긴다
@@ -896,7 +964,9 @@ class X2SimNode(Node):
         while rclpy.ok():
             t_start = time.monotonic()
             try:
-                with self.prev_lock:
+                # render_lock 공유: 온디맨드 640 렌더와의 '동시 렌더'가
+                # OSMesa 세그폴트(2회 실측)의 유력 원인 — GL은 직렬화
+                with self.render_lock, self.prev_lock:
                     r = self.renderer_prev
                     if r is None:
                         time.sleep(0.1)
