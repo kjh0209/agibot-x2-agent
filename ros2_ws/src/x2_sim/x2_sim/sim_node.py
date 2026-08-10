@@ -541,6 +541,17 @@ class X2SimNode(Node):
         return {'right_shoulder_pitch_joint': -0.9,
                 'right_elbow_joint': -0.9}
 
+    # 랜드마크로 노출할 정적 소품 → 친화적 이름 매핑.
+    # 배경: "나무 쓰다듬어줘"에서 LLM이 나무까지의 거리를 알 방법이
+    # 없어(집기 물체 거리만 주입) 3.5m 밖에서 팔만 흔들고 했다고
+    # 거짓 보고한 사고 — confabulation은 데이터로 차단한다는 원칙.
+    LANDMARKS = {
+        'sofa_seat': 'sofa', 'tea_table': 'tea_table', 'tv': 'tv',
+        'plant_pot': 'plant', 'island': 'island', 'counter': 'counter',
+        'fridge': 'fridge', 'stove': 'stove', 'desk': 'desk',
+        'studio_table': 'studio_table',
+    }
+
     def publish_objects(self):
         objs = {}
         for name, info in self.graspables.items():
@@ -548,8 +559,16 @@ class X2SimNode(Node):
             objs[name] = {'x': round(float(p[0]), 2),
                           'y': round(float(p[1]), 2),
                           'z': round(float(p[2]), 2)}
+        lands = {}
+        for prop, friendly in self.LANDMARKS.items():
+            gid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, prop)
+            if gid >= 0:
+                p = self.data.geom_xpos[gid]
+                lands[friendly] = {'x': round(float(p[0]), 2),
+                                   'y': round(float(p[1]), 2)}
         payload = {'world': self.world_name, 'carrying': self.carrying,
-                   'objects': objs}
+                   'objects': objs, 'landmarks': lands}
         self.pub_objects.publish(String(
             data=json.dumps(payload, ensure_ascii=False)))
 
@@ -980,6 +999,11 @@ class X2SimNode(Node):
 def main():
     from x2_sim.single_instance import claim
     _lock = claim('x2_sim')            # noqa: F841 — 수명 유지용
+    # SIGTERM 즉시 종료 — 기본 동작은 rclpy만 반파된 채 프로세스가
+    # 살아남아 토픽이 끊긴 반좀비가 됨 (agent_node와 동일 실측 패턴)
+    import os as _os
+    import signal as _signal
+    _signal.signal(_signal.SIGTERM, lambda *_: _os._exit(0))
     rclpy.init()
     node = X2SimNode()
     executor = MultiThreadedExecutor(num_threads=3)

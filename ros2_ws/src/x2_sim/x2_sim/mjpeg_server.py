@@ -198,6 +198,9 @@ def main():
     global viewer_node
     from x2_sim.single_instance import claim
     _lock = claim('mjpeg_server')      # noqa: F841 — 수명 유지용
+    import os as _os
+    import signal as _signal
+    _signal.signal(_signal.SIGTERM, lambda *_: _os._exit(0))
     rclpy.init()
     node = ViewerNode()
     viewer_node = node

@@ -389,6 +389,13 @@ class ToolExecutor:
         '소파': 'sofa', 'sofa': 'sofa',
         '냉장고': 'fridge', 'fridge': 'fridge',
         '집': 'home', 'home': 'home',
+        '나무': 'plant', '화분': 'plant', 'plant': 'plant',
+        '티비': 'tv', '텔레비전': 'tv', 'tv': 'tv',
+        '티테이블': 'tea_table', '테이블': 'tea_table',
+        'tea_table': 'tea_table',
+        '아일랜드': 'island', 'island': 'island',
+        '조리대': 'counter', '카운터': 'counter', 'counter': 'counter',
+        '책상': 'office', 'desk': 'office',
     }
 
     def _rotate_to(self, target_yaw, timeout=10.0):

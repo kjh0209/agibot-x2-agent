@@ -78,11 +78,16 @@ class AgentNode(Node):
         # 주변 물체 + 들고 있는 물체
         import json as _json
         self.objects = {}
+        self.landmarks = {}
+
+        def _on_objects(m):
+            d = _json.loads(m.data)
+            self.objects = d.get('objects', {})
+            self.landmarks = d.get('landmarks', {})
+
         self.carrying = ''
         self.create_subscription(
-            String, '/x2_sim/objects',
-            lambda m: setattr(self, 'objects',
-                              _json.loads(m.data).get('objects', {})), 10)
+            String, '/x2_sim/objects', _on_objects, 10)
         latched3 = QoSProfile(depth=1)
         latched3.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.create_subscription(
@@ -175,6 +180,14 @@ class AgentNode(Node):
                 nearby[name] = round(d, 2)
             st['nearby_objects_dist_m'] = dict(
                 sorted(nearby.items(), key=lambda kv: kv[1]))
+        if self.landmarks and self.odom:
+            rx, ry = self.odom
+            lm = {}
+            for name, p in self.landmarks.items():
+                lm[name] = round(math.hypot(p['x'] - rx, p['y'] - ry), 2)
+            # 가구/랜드마크 거리 — 접근 동작(쓰다듬기 등)의 근거 데이터
+            st['nearby_landmarks_dist_m'] = dict(
+                sorted(lm.items(), key=lambda kv: kv[1]))
         if self.odom:
             st['position'] = {'x': round(self.odom[0], 2),
                               'y': round(self.odom[1], 2)}
