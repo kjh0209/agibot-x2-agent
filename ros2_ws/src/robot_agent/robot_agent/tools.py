@@ -443,6 +443,40 @@ class ToolExecutor:
         msg.angular_velocity = 0.0
         self.pub_vel.publish(msg)
 
+    def turn(self, angle_deg: float):
+        """제자리 회전 (상대 각도, 폐루프) — "뒤돌아"류 요청 전용.
+
+        move의 wz는 상한(0.5rad/s × 3s)에 가속 램프까지 겹쳐 한 번에
+        ~80°가 한계라, 큰 회전을 시키면 30~50°에서 끝나는 문제가
+        있었음(사용자 제보). IMU 요 기준 목표각까지 도는 폐루프."""
+        args = {'angle_deg': angle_deg}
+        guard = self._battery_guard()
+        if guard:
+            return {'error': guard}
+        try:
+            self.ensure_source()
+            self.ensure_mode(int(McAction.LOCOMOTION_DEFAULT))
+        except RuntimeError as e:
+            self.audit('turn', args, False, str(e))
+            return {'error': str(e)}
+        a = max(-360.0, min(360.0, float(angle_deg)))
+        start = self.node.yaw_rad()
+        target = start + math.radians(a)
+        self._stop_requested = False
+        # 180° 초과 회전은 중간 경유각으로 나눠 최단경로 오해 방지
+        steps = [target] if abs(a) <= 200 else [
+            start + math.radians(a / 2.0), target]
+        for t in steps:
+            if self._stop_requested:
+                break
+            self._rotate_to(t, timeout=12.0)
+        turned = math.degrees(
+            (self.node.yaw_rad() - start + math.pi) % (2 * math.pi)
+            - math.pi)
+        self.audit('turn', args, True, f'turned {turned:.0f}deg')
+        return {'ok': f'회전 완료: 요청 {a:.0f}°, 실제 {turned:.0f}° '
+                      f'(look으로 새 방향 확인 가능)'}
+
     def _dock(self, max_dist=0.6, forward=False, timeout=6.0):
         """천천히 전/후진해 가구(소파·테이블 등)에 밀착. 충돌 차단으로
         위치가 더 이상 변하지 않으면(=닿음) 정지."""

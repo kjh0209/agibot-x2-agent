@@ -26,6 +26,7 @@ FEATURES = {
     'look':        {'kind': 'tool', 'tier': 'parity'},
     'get_status':  {'kind': 'tool', 'tier': 'parity'},
     'move':        {'kind': 'tool', 'tier': 'parity'},
+    'turn':        {'kind': 'tool', 'tier': 'parity'},
     'play_motion': {'kind': 'tool', 'tier': 'parity'},
     'speak':       {'kind': 'tool', 'tier': 'parity'},
     'show_emoji':  {'kind': 'tool', 'tier': 'parity'},
@@ -118,7 +119,7 @@ def body_facts(target: str = None) -> str:
             '  안 된다고 말한다.')
     lines.append(
         '- 고개 돌리기는 preset(POINT_HEAD/SHAKE_HEAD)에는 있지만 특정 각도로\n'
-        '  돌리는 기능은 아직 없다 — 대신 몸 전체를 move(wz)로 돌릴 수 있다.')
+        '  돌리는 기능은 아직 없다 — 대신 몸 전체를 turn(각도)으로 돌린다.')
     if is_enabled('go_to_place', target):
         lines.append(
             '- 기본 공간은 집(home)이며 거실/주방/현관/소파/냉장고/스튜디오/\n'

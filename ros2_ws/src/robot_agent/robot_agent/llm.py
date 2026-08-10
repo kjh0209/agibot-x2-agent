@@ -110,6 +110,19 @@ ALL_TOOLS = [
         },
     },
     {
+        'name': 'turn',
+        'description': ('제자리 회전 (상대 각도, 완료까지 돎). 양수=왼쪽'
+                        '(반시계)/음수=오른쪽. "뒤돌아"=turn(180), '
+                        '"오른쪽 봐"=turn(-90). ★큰 회전(45° 이상)은 '
+                        '반드시 이 툴 — move의 wz로는 상한 때문에 한 번에 '
+                        '~80°가 한계다.'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'angle_deg': {'type': 'number'}},
+            'required': ['angle_deg'],
+        },
+    },
+    {
         'name': 'play_motion',
         'description': (
             '프리셋 동작 실행. 지원: WAVE_HAND(손 흔들기), RAISE_HAND(손 들기), '
