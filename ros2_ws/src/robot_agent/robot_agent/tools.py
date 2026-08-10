@@ -12,6 +12,7 @@
 """
 import base64
 import json
+import math
 import os
 import threading
 import time
@@ -209,6 +210,20 @@ class ToolExecutor:
             st['mode'] = ACTION_NAMES.get(self.current_action(), '?')
         except RuntimeError as e:
             st['mode'] = f'조회 실패: {e}'
+        # 탐색 모드(미지 공간): 지도 사전 지식을 주지 않는다 —
+        # 물체는 2m 근접에서만 감지되고, 장소는 학습한 것만 노출
+        from x2_sim.worlds import WORLDS as _W
+        if _W.get(self.node.current_world, {}).get('explore'):
+            st['explore_mode'] = True
+            if 'nearby_objects_dist_m' in st:
+                st['nearby_objects_dist_m'] = {
+                    k: v for k, v in st['nearby_objects_dist_m'].items()
+                    if v <= 2.0}
+            st.pop('nearby_landmarks_dist_m', None)
+            lm = self._learned(self.node.current_world)
+            st['learned_places'] = sorted(lm['places'].keys())
+            if lm.get('objects_seen'):
+                st['objects_seen_during_explore'] = lm['objects_seen']
         return st
 
     def get_status(self):
@@ -443,6 +458,313 @@ class ToolExecutor:
         msg.forward_velocity = 0.0
         self.pub_vel.publish(msg)
 
+    # ---------- 탐색·학습 (미지 공간: explore 월드) ----------
+    # 처음 보는 공간에서 로봇이 지도를 스스로 만든다:
+    #   · 프론티어 탐색 — 가본 셀(0.8m 격자)의 미방문 이웃으로 계속 전진,
+    #     충돌 차단을 범퍼 삼아 막힌 셀은 제외
+    #   · 지점마다 4방향 VLM 스캔 — 방/가구/물체 자가 인식
+    #   · 인식한 가구에 접근해 그 지점을 장소로 자동 등록
+    #   · '가본 셀'만으로 길 찾기 (BFS) — 배운 길만 안다
+    # 결과는 /ws/log/learned/<world>.json 영속화. 사람 교육은
+    # remember_place(보정용)로 최소화. 실기에서는 SLAM 탐색으로 대체.
+    CELL = 0.8
+
+    VLM_SCAN_PROMPT = (
+        '실내를 다니는 로봇의 카메라 프레임이다. 단순 도형으로 만든 '
+        '시뮬레이션이므로 색·형태·배치로 추정하라.\n'
+        '다음 JSON만 출력: {"room": "침실|서재|거실|주방|복도|모름", '
+        '"furniture": [...], "objects": [...]}\n'
+        'furniture 후보: 침대, 옷장, 책장, 책상, 의자, 소파, 안락의자, '
+        '테이블, 화분, 티비\n'
+        'objects 후보: 공, 컵, 인형, 책, 과일, 병\n'
+        '화면 중앙 근처에 확실히 보이는 것만. 없으면 빈 배열.')
+
+    def _learned(self, world):
+        if not hasattr(self, '_learned_cache'):
+            self._learned_cache = {}
+        if world not in self._learned_cache:
+            try:
+                with open(f'/ws/log/learned/{world}.json') as f:
+                    d = json.load(f)
+                d['cells'] = set(tuple(c) for c in d.get('cells', []))
+            except Exception:
+                d = {'places': {}, 'cells': set(),
+                     'objects_seen': {}, 'rooms': {}}
+            self._learned_cache[world] = d
+        return self._learned_cache[world]
+
+    def _save_learned(self, world):
+        d = self._learned(world)
+        os.makedirs('/ws/log/learned', exist_ok=True)
+        out = dict(d)
+        out['cells'] = sorted(list(c) for c in d['cells'])
+        with open(f'/ws/log/learned/{world}.json', 'w') as f:
+            json.dump(out, f, ensure_ascii=False, indent=1)
+
+    def _cell(self, x, y):
+        return (int(math.floor(x / self.CELL + 0.5)),
+                int(math.floor(y / self.CELL + 0.5)))
+
+    # 4방향만 — 대각 이동은 문틀/벽 모서리를 깎아 지나가려다 걸린다
+    # (newhouse 문턱 스턱 실측)
+    _NB8 = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+    def _bfs_cells(self, cells, start, goal):
+        from collections import deque
+        if start == goal:
+            return [start]
+        seen = {start: None}
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            for dx, dy in self._NB8:
+                nxt = (cur[0] + dx, cur[1] + dy)
+                if nxt in seen or nxt not in cells:
+                    continue
+                seen[nxt] = cur
+                if nxt == goal:
+                    path = [nxt]
+                    while seen[path[-1]] is not None:
+                        path.append(seen[path[-1]])
+                    return list(reversed(path))
+                q.append(nxt)
+        return None
+
+    def _nearest_frontier(self, cells, blocked, start):
+        """가본 셀에서 BFS로 가장 가까운 '미방문 이웃 셀'을 찾는다."""
+        from collections import deque
+        seen = {start}
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            for dx, dy in self._NB8:
+                nxt = (cur[0] + dx, cur[1] + dy)
+                if nxt in blocked:
+                    continue
+                if nxt in cells:
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        q.append(nxt)
+                else:
+                    return nxt
+        return None
+
+    def _vlm_look(self):
+        """현재 시야 1프레임을 VLM(Haiku 비전)으로 분류. 실패 시 None."""
+        if ROBOT_TARGET == 'sim':
+            self.pub_render_hq.publish(String(data='explore'))
+        frame = self.node.latest_frame(fresh=True, timeout=2.5)
+        if frame is None:
+            return None
+        try:
+            import anthropic
+            if not hasattr(self, '_vlm'):
+                self._vlm = anthropic.Anthropic()
+            r = self._vlm.messages.create(
+                model='claude-haiku-4-5', max_tokens=250,
+                messages=[{'role': 'user', 'content': [
+                    {'type': 'image', 'source': {
+                        'type': 'base64', 'media_type': 'image/jpeg',
+                        'data': base64.standard_b64encode(frame).decode()}},
+                    {'type': 'text', 'text': self.VLM_SCAN_PROMPT}]}])
+            txt = ''.join(b.text for b in r.content if b.type == 'text')
+            txt = txt[txt.find('{'):txt.rfind('}') + 1]
+            out = json.loads(txt)
+            self.audit('vlm_scan', {}, True,
+                       json.dumps(out, ensure_ascii=False))
+            return out
+        except Exception as e:
+            self.audit('vlm_scan', {}, False, str(e))
+            return None
+
+    def _approach_and_register(self, lm, name, yaw):
+        """인식한 가구를 향해 전진(막히거나 1.6m)한 지점을 장소로 등록."""
+        self._rotate_to(yaw)
+        start = self.node.odom
+        if start is None:
+            return
+        msg = McLocomotionVelocity()
+        msg.source = SOURCE
+        last, stall = start, 0
+        t_end = time.monotonic() + 8.0
+        while time.monotonic() < t_end and not self._stop_requested:
+            pos = self.node.odom
+            lm['cells'].add(self._cell(*pos))
+            if math.hypot(pos[0] - start[0], pos[1] - start[1]) >= 1.6:
+                break
+            if math.hypot(pos[0] - last[0], pos[1] - last[1]) < 0.005:
+                stall += 1
+                if stall >= 5:
+                    break              # 가구 앞 밀착 = 접근 완료
+            else:
+                stall = 0
+            last = pos
+            msg.forward_velocity = 0.2
+            self.pub_vel.publish(msg)
+            time.sleep(0.1)
+        msg.forward_velocity = 0.0
+        self.pub_vel.publish(msg)
+        pos = self.node.odom
+        lm['places'][name] = {'pos': [round(pos[0], 2), round(pos[1], 2)],
+                              'yaw': round(self.node.yaw_rad(), 2)}
+        self.node.notify_event(f'탐색: {name} 발견 → 장소로 기억함')
+        self._dock(max_dist=0.5, forward=False)   # 물러나 탐색 재개
+
+    def _scan_and_register(self, lm, world):
+        """제자리 4방향 VLM 스캔 → 방/가구/물체 기록. 새 가구면 접근·등록."""
+        base_yaw = self.node.yaw_rad()
+        for k in range(4):
+            if self._stop_requested:
+                return
+            yaw = base_yaw + k * (math.pi / 2.0)
+            self._rotate_to(yaw, timeout=7.0)
+            res = self._vlm_look()
+            if not res:
+                continue
+            pos = self.node.odom or (0.0, 0.0)
+            room = str(res.get('room') or '모름')
+            if room != '모름' and room not in lm['rooms']:
+                lm['rooms'][room] = [round(pos[0], 2), round(pos[1], 2)]
+                lm['places'].setdefault(
+                    room, {'pos': [round(pos[0], 2), round(pos[1], 2)],
+                           'yaw': round(yaw, 2)})
+                self.node.notify_event(f'탐색: 여기는 {room}인 것 같음')
+            for o in (res.get('objects') or []):
+                o = str(o)
+                if o and o not in lm['objects_seen']:
+                    lm['objects_seen'][o] = {
+                        'near': [round(pos[0], 2), round(pos[1], 2)]}
+            for fname in (res.get('furniture') or []):
+                fname = str(fname)
+                if fname and fname not in lm['places']:
+                    self._approach_and_register(lm, fname, yaw)
+                    self._save_learned(world)
+                    return                 # 위치가 변했으니 스캔 종료
+        self._save_learned(world)
+
+    def explore(self, duration_s: float = 180):
+        """미지 공간 자율 탐색 — 프론티어 이동 + VLM 자가 인식 + 장소 등록."""
+        from x2_sim.worlds import WORLDS
+        world = self.node.current_world
+        args = {'duration_s': duration_s}
+        if not WORLDS.get(world, {}).get('explore'):
+            msg = '이 공간은 이미 지도가 있는 곳 — 탐색 모드 공간에서만 사용'
+            self.audit('explore', args, False, msg)
+            return {'error': msg}
+        guard = self._battery_guard()
+        if guard:
+            return {'error': guard}
+        try:
+            self.ensure_source()
+            self.ensure_mode(int(McAction.LOCOMOTION_DEFAULT))
+        except RuntimeError as e:
+            return {'error': str(e)}
+        duration_s = max(30.0, min(300.0, float(duration_s)))
+        self._stop_requested = False
+        lm = self._learned(world)
+        blocked = set()
+        t_end = time.monotonic() + duration_s
+        last_scan = None
+        while time.monotonic() < t_end and not self._stop_requested:
+            pos = self.node.odom
+            if pos is None:
+                break
+            cell = self._cell(*pos)
+            lm['cells'].add(cell)
+            if last_scan is None or (abs(cell[0] - last_scan[0])
+                                     + abs(cell[1] - last_scan[1])) >= 2:
+                self._scan_and_register(lm, world)
+                last_scan = self._cell(*(self.node.odom or pos))
+                continue
+            target = self._nearest_frontier(lm['cells'], blocked, cell)
+            if target is None:
+                break                      # 갈 수 있는 미방문 셀 없음
+            path = self._bfs_cells(lm['cells'] | {target}, cell, target)
+            step = path[1] if path and len(path) > 1 else target
+            ok, detail = self._navigate(
+                [(step[0] * self.CELL, step[1] * self.CELL)], timeout=12.0)
+            if not ok:
+                if 'stop' in detail:
+                    break
+                blocked.add(step)
+        self._save_learned(world)
+        summary = (f'탐색 종료 — 방 {sorted(lm["rooms"])}, '
+                   f'배운 장소 {sorted(lm["places"])}, '
+                   f'본 물체 {sorted(lm["objects_seen"])}, '
+                   f'가본 셀 {len(lm["cells"])}개. '
+                   f'이제 배운 장소는 go_to_place로 갈 수 있음')
+        self.audit('explore', args, True, summary)
+        return {'ok': summary}
+
+    def _go_to_learned(self, place, args):
+        """탐색 모드: 배운 장소로, 가본 셀만 밟아 이동."""
+        cur = self.node.current_world
+        lm = self._learned(cur)
+        key = str(place).strip()
+        entry = lm['places'].get(key)
+        if entry is None:
+            msg = (f'아직 모르는 장소 {place!r} — 지금까지 배운 곳: '
+                   f'{sorted(lm["places"]) or "없음"}. explore로 더 '
+                   f'탐색하거나, 그 자리에서 remember_place로 가르쳐줘야 함')
+            self.audit('go_to_place', args, False, msg)
+            return {'error': msg}
+        tx, ty = entry['pos']
+        pos = self.node.odom or (0.0, 0.0)
+        cells = set(lm['cells'])
+        start_c = self._cell(*pos)
+        cells.add(start_c)
+        goal_c = self._cell(tx, ty)
+        if goal_c not in cells:
+            goal_c = min(cells, key=lambda c: (c[0] - goal_c[0]) ** 2
+                         + (c[1] - goal_c[1]) ** 2)
+        path = self._bfs_cells(cells, start_c, goal_c)
+        wps = []
+        if path is None:
+            # 현재 위치가 학습 셀과 단절(탐색 때 안 가본 곳) —
+            # 최근접 학습 셀로 먼저 이동(앵커) 후 그 셀에서 경로 탐색.
+            # 직선 폴백은 문틀을 깎다 스턱되는 원인이라 금지.
+            anchor = min(lm['cells'],
+                         key=lambda c: (c[0] * self.CELL - pos[0]) ** 2
+                         + (c[1] * self.CELL - pos[1]) ** 2, default=None)
+            if anchor is not None:
+                wps.append((anchor[0] * self.CELL, anchor[1] * self.CELL))
+                path = self._bfs_cells(cells, anchor, goal_c)
+        if path:
+            # 전 셀 경유 — 건너뛰기(직선화)는 문틀 모서리를 깎아 스턱됨
+            wps += [(c[0] * self.CELL, c[1] * self.CELL)
+                    for c in path[1:]]
+        wps.append((float(tx), float(ty)))
+        t0 = time.monotonic()
+        ok, detail = self._navigate(wps, timeout=120.0)
+        if ok:
+            if entry.get('yaw') is not None:
+                self._rotate_to(entry['yaw'])
+            result = (f'{place}까지 배운 길로 걸어서 도착 '
+                      f'({time.monotonic() - t0:.0f}초). look으로 확인 가능')
+            self.audit('go_to_place', args, True, result)
+            return {'ok': result}
+        self.audit('go_to_place', args, False, detail)
+        return {'error': f'{place}로 가는 중 문제: {detail}'}
+
+    def remember_place(self, name: str):
+        """사용자가 알려준 이름으로 현재 위치를 장소로 저장 (최소 교육)."""
+        from x2_sim.worlds import WORLDS
+        world = self.node.current_world
+        if not WORLDS.get(world, {}).get('explore'):
+            return {'error': '지도가 이미 있는 공간 — 탐색 모드에서만 사용'}
+        pos = self.node.odom
+        if pos is None:
+            return {'error': '위치 정보 없음'}
+        lm = self._learned(world)
+        key = str(name).strip()
+        lm['places'][key] = {'pos': [round(pos[0], 2), round(pos[1], 2)],
+                             'yaw': round(self.node.yaw_rad(), 2)}
+        lm['cells'].add(self._cell(*pos))
+        self._save_learned(world)
+        self.audit('remember_place', {'name': key}, True, str(lm['places'][key]))
+        return {'ok': f'기억했음: {key} = 현재 위치 '
+                      f'({pos[0]:.1f}, {pos[1]:.1f})'}
+
     # ---------- 보행 내비게이션 (home 월드: 진짜 걸어서 이동) ----------
     def _navigate(self, waypoints, timeout=90.0):
         """웨이포인트를 향해 회전→직진 반복 (velocity 명령만 사용 —
@@ -461,7 +783,7 @@ class ToolExecutor:
         for i, (wx, wy) in enumerate(waypoints):
             # 중간 웨이포인트는 느슨하게 통과(0.5m), 최종 목적지만 정밀(0.35m)
             radius = 0.35 if i == n_wp - 1 else 0.5
-            retried = False
+            retried = 0
             best_err = None
             while True:
                 if self._stop_requested:
@@ -484,18 +806,23 @@ class ToolExecutor:
                 elif best_err is None or _e < best_err - 0.05:
                     best_err, best_t = _e, time.monotonic()
                 elif time.monotonic() - best_t > 5.0:
-                    if not retried:
-                        # 언스턱: 1.5초 후진 후 같은 웨이포인트 1회 재시도
-                        retried = True
-                        msg.forward_velocity = -0.2
+                    if retried < 3:
+                        # 언스턱 3단: ①후진 1.5s ②좌측 이동 1.2s
+                        # ③우측 이동 2.0s(좌측 복귀분 포함) — 문틀이
+                        # 어느 쪽에 있는지 모르므로 양방향 시도
+                        msg.forward_velocity = (-0.2 if retried == 0
+                                                else 0.0)
+                        msg.lateral_velocity = (0.0, 0.15, -0.15)[retried]
                         msg.angular_velocity = 0.0
-                        t_back = time.monotonic() + 1.5
+                        t_back = time.monotonic() + (1.5, 1.2, 2.0)[retried]
                         while (time.monotonic() < t_back
                                and not self._stop_requested):
                             self.pub_vel.publish(msg)
                             time.sleep(0.1)
                         msg.forward_velocity = 0.0
+                        msg.lateral_velocity = 0.0
                         self.pub_vel.publish(msg)
+                        retried += 1
                         best, best_t = None, time.monotonic()
                         best_err = None
                         continue
@@ -524,6 +851,10 @@ class ToolExecutor:
 
     def go_to_place(self, place: str):
         args = {'place': place}
+        from x2_sim.worlds import WORLDS as _WORLDS
+        # 탐색 모드 공간은 별칭 사전을 쓰지 않는다 — 학습 장소명 그대로
+        if _WORLDS.get(self.node.current_world, {}).get('explore'):
+            return self._go_to_learned(place, args)
         key = str(place).strip().lower()
         world = self.PLACES.get(key) or self.PLACES.get(str(place).strip())
         if world is None:
@@ -537,10 +868,10 @@ class ToolExecutor:
             self.audit('go_to_place', args, False, msg)
             return {'error': msg}
 
+        from x2_sim.worlds import WORLDS
         # ★home 월드 안의 방이면 순간이동이 아니라 실제로 걸어간다.
         #   다른 공간(스튜디오 등)에 있어도 먼저 home으로 복귀 후 걷는다
         #   — 모든 장소가 항상 연결되어 있게.
-        from x2_sim.worlds import WORLDS
         home = WORLDS.get('home', {})
         places = home.get('places', {})
         if world in places and self.node.current_world != 'home':

@@ -52,6 +52,13 @@ SYSTEM_BASE = """\
   말하는 것은 금지.
 - ★완료 보고는 사실만: 거리·상태값으로 확인되지 않은 일을 했다고
   주장하지 않는다. 접근이 안 됐으면 "아직 못 갔어"라고 말한다.
+- ★탐색 모드(상태에 explore_mode=true): 지금 공간은 처음 보는 곳이라
+  지도가 없다. 이때는 ①learned_places에 있는 장소만 go_to_place 가능
+  ②"둘러봐/파악해봐" 요청은 explore 호출(오래 걸림 — 시작을 알리고,
+  끝나면 발견한 것을 요약해 보고) ③사용자가 "여기가 ~야"라고 하면
+  remember_place ④물체는 2m 이내에서만 감지된다 — 안 보이면 아직 그
+  근처를 탐색 못 한 것이니 지어내지 말고 탐색이 필요하다고 말한다.
+  objects_seen_during_explore는 탐색 중 목격한 물체의 대략 위치다.
 
 # 몸에 대한 사실
 {BODY_FACTS}
@@ -177,6 +184,30 @@ ALL_TOOLS = [
             'type': 'object',
             'properties': {'place': {'type': 'string'}},
             'required': ['place'],
+        },
+    },
+    {
+        'name': 'explore',
+        'description': ('★처음 보는 공간(상태에 explore_mode=true) 전용: '
+                        '자율 탐색으로 공간을 파악한다 — 안 가본 곳으로 '
+                        '걸어 다니며 방/가구/물체를 스스로 인식하고 장소로 '
+                        '기억한다. 수 분 걸리고 완료 후 발견 요약이 '
+                        '반환된다. "둘러봐/집 구경해/파악해봐" 요청에 사용.'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'duration_s': {
+                'type': 'number',
+                'description': '탐색 시간(초, 기본 180, 최대 300)'}},
+        },
+    },
+    {
+        'name': 'remember_place',
+        'description': ('현재 위치를 이름으로 기억한다. 탐색 모드 공간에서 '
+                        '사용자가 "여기가 ~야"라고 알려줄 때 사용.'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'name': {'type': 'string'}},
+            'required': ['name'],
         },
     },
     {

@@ -395,6 +395,14 @@ class X2SimNode(Node):
         self._sit_blend = 0.0   # 0=서기, 1=앉기 — 1.2s 램프로 전환
         self.base_z0 = float(self.data.qpos[2])
         self.prop_gids = set()
+        # ★이동 차단 = 기하 판정 (물리 접촉과 분리).
+        # 접촉 기반 롤백은 유연한 관절이 지오메트리에 박히면 관통·법선이
+        # 물리 노이즈에 흔들려 전방향 교착이 반복 재발했음 (문틀 실측
+        # 3차). 대신 '베이스 중심 vs 가구 2D AABB + 여유 반경'의 순수
+        # 기하 규칙으로 게이팅: 결정론적, 노이즈 0, 팔다리 무관.
+        # 낮은 가구(윗면 z<0.5 — 소파/침대/티테이블 등 앉는 면)는 여유를
+        # 작게(0.12m) 둬 도킹 밀착이 가능하고, 벽/장롱류는 0.30m.
+        self.block_zones = []
         for name in prop_names:
             # 바닥 오버레이/러그는 로봇이 밟고 서는 면 — 차단 대상 아님
             if '_floor' in name or name == 'rug':
@@ -403,7 +411,21 @@ class X2SimNode(Node):
                 self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
             if gid >= 0:
                 self.prop_gids.add(gid)
+                p = self.model.geom_pos[gid]
+                s = self.model.geom_size[gid]
+                gtype = int(self.model.geom_type[gid])
+                if gtype == int(mujoco.mjtGeom.mjGEOM_BOX):
+                    hx, hy, top = float(s[0]), float(s[1]), \
+                        float(p[2]) + float(s[2])
+                else:                      # cylinder/sphere: 반경 기반
+                    hx = hy = float(s[0])
+                    top = float(p[2]) + float(s[1] if gtype == int(
+                        mujoco.mjtGeom.mjGEOM_CYLINDER) else s[0])
+                margin = 0.30 if top >= 0.5 else 0.12
+                self.block_zones.append(
+                    (float(p[0]), float(p[1]), hx, hy, margin, name))
         self._contact_prev = False
+        self._pen_last = 0.0
         self._blocked_logged = False
 
         for attr in ('renderer', 'renderer_prev'):
@@ -655,9 +677,9 @@ class X2SimNode(Node):
     def _robot_prop_contact(self) -> bool:
         """로봇 geom과 소품 geom 사이의 접촉 존재 여부.
 
-        차단 대상 접촉의 법선(소품→로봇)을 전부 수집한다
-        (_last_contact_normals) — 탈출 판정은 다중 접촉을 모두 봐야 함."""
-        self._last_contact_normals = []
+        차단 대상 접촉의 관통 깊이 합(_last_contact_pen)도 계산한다 —
+        탈출 판정은 '관통이 늘지 않으면 허용'(단조 규칙)."""
+        self._last_contact_pen = 0.0
         found = False
         for i in range(self.data.ncon):
             c = self.data.contact[i]
@@ -673,9 +695,7 @@ class X2SimNode(Node):
                 continue              # 집기 물체가 소품 위에 놓인 것 — 로봇 아님
             if other_body in self.arm_bids:
                 continue              # 팔 스침은 차단 사유 아님 (회전 교착 방지)
-            # 접촉 법선 (소품→로봇 방향) — 탈출 이동 허용 판정에 사용
-            n = np.array(c.frame[0:3])
-            self._last_contact_normals.append(n if a_prop else -n)
+            self._last_contact_pen += max(0.0, -float(c.dist))
             if found:
                 continue              # 이름 로깅은 첫 접촉만
             found = True
@@ -692,53 +712,9 @@ class X2SimNode(Node):
         with self.state_lock:
             for _ in range(self.substeps):
                 self.apply_pd()
-                prev_xyz = self.base_xyz.copy()
-                prev_yaw = self.base_yaw
-                self.apply_locomotion()
+                self.apply_locomotion()   # 이동 게이팅은 이 안(기하 판정)
                 mujoco.mj_step(self.model, self.data)
                 self.apply_carry()
-                hit = self._robot_prop_contact()
-                # 차단 기준은 "마지막 승인 위치의 접촉 여부"다.
-                # (직전 스텝이 아니라 승인 위치 기준이어야 접촉이 지속되는
-                #  동안에도 계속 차단된다 — 진입-순간만 보면 뚫고 지나감)
-                if hit and not self._contact_prev:
-                    # ★탈출 허용: 도킹·착석이 '접촉 중' 상태를 만들면
-                    # 종전 규칙은 탈출 이동까지 롤백해 영구 교착이었음
-                    # (소파에서 일어선 뒤 못 걷던 사고). 모든 차단 접촉에
-                    # 대해 아래 중 하나면 이동 승인:
-                    #   · 법선이 거의 수직(윗면 겹침 — 소파 위에 서 있는
-                    #     경우): 수평 이동으로는 더 파고들 수 없음
-                    #   · 수평 법선과 이동 변위의 내적 ≥ 0 (멀어지거나
-                    #     벽면을 따라 미끄러지는 이동)
-                    # 하나라도 '접촉을 향한' 수평 이동이면 롤백.
-                    # _contact_prev는 갱신하지 않음 (진입은 계속 차단).
-                    disp = self.base_xyz[:2] - prev_xyz[:2]
-                    normals = getattr(self, '_last_contact_normals', [])
-                    ok_escape = bool(normals)
-                    for n in normals:
-                        nxy = math.hypot(n[0], n[1])
-                        if nxy < 0.3:
-                            continue          # 수직 접촉 — 수평 이동 무해
-                        if disp[0] * n[0] + disp[1] * n[1] >= -1e-7:
-                            continue          # 멀어짐/평행 — 허용
-                        ok_escape = False
-                        break
-                    if ok_escape:
-                        continue
-                    self.base_xyz[:] = prev_xyz
-                    self.base_yaw = prev_yaw
-                    self.cmd_vel[:] = 0.0
-                    # 승인 위치는 그대로(접촉 없음) → _contact_prev 유지
-                    if not self._blocked_logged:
-                        pair = getattr(self, '_last_contact_pair', ('?', '?'))
-                        self.get_logger().warning(
-                            f'장애물 접촉 — 이동 차단 (베이스 롤백): '
-                            f'소품={pair[0]} ↔ 로봇측={pair[1]}')
-                        self._blocked_logged = True
-                else:
-                    # 이동을 승인 — 승인 위치의 접촉 상태 갱신
-                    # (시작부터 접촉 상태인 경우 탈출 이동 허용)
-                    self._contact_prev = hit
         self.publish_joints()
         self.publish_imu()
         self.publish_odom()
@@ -773,6 +749,19 @@ class X2SimNode(Node):
             tau, self.model.actuator_ctrlrange[:, 0],
             self.model.actuator_ctrlrange[:, 1]) \
             if self.model.actuator_ctrllimited.any() else tau
+
+    def _zone_pen(self, x, y):
+        """(x,y)에서 가구 차단 구역 관통량(최댓값). 0이면 자유 공간."""
+        worst = 0.0
+        for (cx, cy, hx, hy, margin, name) in self.block_zones:
+            dx = abs(x - cx) - hx
+            dy = abs(y - cy) - hy
+            d = math.hypot(max(0.0, dx), max(0.0, dy))
+            pen = margin - d
+            if pen > worst:
+                worst = pen
+                self._zone_hit_name = name
+        return worst
 
     def apply_locomotion(self):
         """키네마틱 베이스 이동 (보행 컨트롤러 대체).
@@ -812,10 +801,22 @@ class X2SimNode(Node):
             self.vel_smooth += (target - self.vel_smooth) * min(1.0, dt / 0.25)
         if self.vel_smooth.any():
             c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
-            self.base_xyz[0] += (c * self.vel_smooth[0]
-                                 - s * self.vel_smooth[1]) * dt
-            self.base_xyz[1] += (s * self.vel_smooth[0]
-                                 + c * self.vel_smooth[1]) * dt
+            nx = self.base_xyz[0] + (c * self.vel_smooth[0]
+                                     - s * self.vel_smooth[1]) * dt
+            ny = self.base_xyz[1] + (s * self.vel_smooth[0]
+                                     + c * self.vel_smooth[1]) * dt
+            # 기하 게이팅: 가구 구역 관통이 늘지 않는 이동만 승인
+            # (자유 이동·탈출·구역 경계 미끄러짐 허용, 파고들기 차단)
+            pen_new = self._zone_pen(nx, ny)
+            if pen_new <= 1e-9 or pen_new <= self._zone_pen(
+                    self.base_xyz[0], self.base_xyz[1]) + 1e-9:
+                self.base_xyz[0] = nx
+                self.base_xyz[1] = ny
+            elif not self._blocked_logged:
+                self.get_logger().warning(
+                    f'가구 구역 차단: {getattr(self, "_zone_hit_name", "?")}'
+                    f' (이동 게이팅 — 회전은 허용)')
+                self._blocked_logged = True
             self.base_yaw += self.vel_smooth[2] * dt
 
         moving = bool(self.vel_smooth.any())
