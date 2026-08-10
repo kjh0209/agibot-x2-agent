@@ -392,6 +392,7 @@ class X2SimNode(Node):
         self.batt_start_time = self.data.time
 
         self.posture = 'stand'
+        self._sit_blend = 0.0   # 0=서기, 1=앉기 — 1.2s 램프로 전환
         self.base_z0 = float(self.data.qpos[2])
         self.prop_gids = set()
         for name in prop_names:
@@ -514,19 +515,23 @@ class X2SimNode(Node):
         self.data.qvel[vadr:vadr + 6] = 0.0
 
     def set_posture(self, posture: str):
-        """앉기/서기 자세 (McMock이 SIT_DOWN/STAND_UP 액션에서 호출)."""
+        """앉기/서기 자세 (McMock이 SIT_DOWN/STAND_UP 액션에서 호출).
+
+        즉시 점프가 아니라 _sit_blend 램프(1.2s)로 전환 —
+        베이스 높이를 한 프레임에 바꾸면 화면이 덜컹거림 (실측 제보)."""
         self.posture = posture
-        self.base_xyz[2] = self.base_z0 - 0.23 if posture == 'sit' else self.base_z0
-        self.get_logger().info(f'자세 전환: {posture} (base z={self.base_xyz[2]:.2f})')
+        self.get_logger().info(f'자세 전환 시작: {posture} (1.2s 램프)')
 
     def posture_offsets(self):
-        if self.posture != 'sit':
+        b = self._sit_blend
+        if b < 0.01:
             return None
+        s = b * b * (3.0 - 2.0 * b)   # smoothstep — 시작/끝이 부드럽게
         off = {}
         for side in ('left', 'right'):
-            off[f'{side}_hip_pitch_joint'] = -1.35   # 허벅지 앞으로
-            off[f'{side}_knee_joint'] = 1.5          # 무릎 굽힘
-            off[f'{side}_ankle_pitch_joint'] = -0.15
+            off[f'{side}_hip_pitch_joint'] = -1.35 * s   # 허벅지 앞으로
+            off[f'{side}_knee_joint'] = 1.5 * s          # 무릎 굽힘
+            off[f'{side}_ankle_pitch_joint'] = -0.15 * s
         return off
 
     def carry_arm_offsets(self):
@@ -560,6 +565,8 @@ class X2SimNode(Node):
             self.vel_smooth = np.zeros(3)
             self.cmd_time = 0.0
             self.motion = None
+            self.posture = 'stand'
+            self._sit_blend = 0.0
             self.base_xyz = np.array(self.data.qpos[0:3])
             qw, qx, qy, qz = self.data.qpos[3:7]
             self.base_yaw = math.atan2(2 * (qw * qz + qx * qy),
@@ -642,6 +649,9 @@ class X2SimNode(Node):
                 continue              # 집기 물체가 소품 위에 놓인 것 — 로봇 아님
             if other_body in self.arm_bids:
                 continue              # 팔 스침은 차단 사유 아님 (회전 교착 방지)
+            # 접촉 법선 (소품→로봇 방향) — 탈출 이동 허용 판정에 사용
+            n = np.array(c.frame[0:3])
+            self._last_contact_normal = n if a_prop else -n
             self._last_contact_pair = (
                 mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM,
                                   a if a_prop else b) or '?',
@@ -666,6 +676,17 @@ class X2SimNode(Node):
                 # (직전 스텝이 아니라 승인 위치 기준이어야 접촉이 지속되는
                 #  동안에도 계속 차단된다 — 진입-순간만 보면 뚫고 지나감)
                 if hit and not self._contact_prev:
+                    # ★탈출 허용: 접촉 법선(소품→로봇) 방향으로 멀어지는
+                    # 이동은 승인. 도킹·착석이 '접촉 중' 상태를 만들면
+                    # 종전 규칙은 탈출 이동까지 롤백해 영구 교착이었음
+                    # (소파에서 일어선 뒤 못 걷던 사고 — sofa_seat↔hip).
+                    # _contact_prev는 갱신하지 않아 '접촉을 향한' 이동은
+                    # 계속 차단된다.
+                    disp = self.base_xyz[:2] - prev_xyz[:2]
+                    n = getattr(self, '_last_contact_normal', None)
+                    if n is not None and float(
+                            disp[0] * n[0] + disp[1] * n[1]) > 1e-7:
+                        continue
                     self.base_xyz[:] = prev_xyz
                     self.base_yaw = prev_yaw
                     self.cmd_vel[:] = 0.0
@@ -703,7 +724,7 @@ class X2SimNode(Node):
                 if ai is not None:
                     q_target[ai] += delta
         kp, kd = self.kp, self.kd
-        if self.posture == 'sit':
+        if self._sit_blend > 0.05:
             # 착석 중 허리/다리 강성 상향 — 소파 접촉력이 유연한(kp=120)
             # 관절을 밀어 카메라가 기울던 문제(허리 0.29rad 편차 실측).
             # 실기에서는 MC가 자체 자세 제어를 하므로 시뮬 전용 보정.
@@ -724,6 +745,24 @@ class X2SimNode(Node):
         결과가 실기와 동일하므로 Phase 2~4 개발에 충분하다.
         """
         dt = self.model.opt.timestep
+        # 자세 램프: 앉기/서기를 1.2s에 걸쳐 부드럽게. 베이스 높이는
+        # smoothstep 보간, 일어설 때는 반보(0.18m) 전진 글라이드로
+        # 소파 지오메트리에서 몸을 빼 접촉 끼임(기울어짐·이동 차단)을
+        # 원천 회피.
+        target_b = 1.0 if self.posture == 'sit' else 0.0
+        if self._sit_blend != target_b:
+            prev_b = self._sit_blend
+            step = dt / 1.2
+            self._sit_blend = (min(target_b, prev_b + step)
+                               if target_b > prev_b
+                               else max(target_b, prev_b - step))
+            b = self._sit_blend
+            s = b * b * (3.0 - 2.0 * b)
+            self.base_xyz[2] = self.base_z0 - 0.23 * s
+            if target_b == 0.0:            # 일어서는 중 — 전진 글라이드
+                d = prev_b - self._sit_blend
+                self.base_xyz[0] += 0.18 * d * math.cos(self.base_yaw)
+                self.base_xyz[1] += 0.18 * d * math.sin(self.base_yaw)
         fresh = self.data.time - self.cmd_time <= 0.5
         target = self.cmd_vel if fresh else np.zeros(3)
         # 가감속 램프(τ=0.25s) — 명령 속도를 즉시 적용하면 방향 전환마다
