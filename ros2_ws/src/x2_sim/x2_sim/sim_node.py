@@ -143,7 +143,7 @@ def load_model_with_camera_and_props(model_path: str,
 
     # 기능형 문 — 닫힘 포즈(통로 가로막음)로 생성. 런타임에 열면
     # 문설주 쪽으로 회전·이동 + 충돌/차단 해제 (sim_node._set_door)
-    for d in world.get('doors', []):
+    for d in world.get('door_defs', []):
         g = wb.add_geom()
         g.name = d['name']
         g.type = GEOM_TYPES['box']
@@ -287,6 +287,10 @@ class X2SimNode(Node):
         _lat2.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.pub_costmap = self.create_publisher(
             String, '/x2_sim/costmap', _lat2)
+        _lat3 = QoSProfile(depth=1)
+        _lat3.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.pub_posture_info = self.create_publisher(
+            String, '/x2_sim/posture_info', _lat3)
         self._rebuild_zones()   # 발행자 생성 후 1회 재구축·발행
         self.pub_carrying.publish(String(data=''))
         # 주변 물체 브로드캐스트 (에이전트 상태 주입용)
@@ -484,7 +488,7 @@ class X2SimNode(Node):
         # 기능형 문 등록 + 초기 상태 (프로세스당 월드별 1회만 init 적용
         # — 이후엔 마지막 상태 유지, 실제 문처럼)
         self.doors = {}
-        for dd in WORLDS[world_name].get('doors', []):
+        for dd in WORLDS[world_name].get('door_defs', []):
             gid = mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_GEOM, dd['name'])
             if gid < 0:
@@ -498,7 +502,7 @@ class X2SimNode(Node):
             self._door_init_done = set()
         if world_name not in self._door_init_done:
             self._door_init_done.add(world_name)
-            for dd in WORLDS[world_name].get('doors', []):
+            for dd in WORLDS[world_name].get('door_defs', []):
                 if dd.get('init') == 'open' and dd['name'] in self.doors:
                     self._set_door(dd['name'], 'open', rebuild=False)
             self._rebuild_zones()
@@ -669,6 +673,7 @@ class X2SimNode(Node):
         c, s = math.cos(yaw), math.sin(yaw)
         glide = (0.0, 0.0)
         dyaw = 0.0
+        self._pose_surface = 0.0        # 앉/눕 표면 높이 (정직 보고용)
         if posture == 'sit':
             back = self._find_platform(-1, (0.25, 0.4, 0.55, 0.7))
             front = None if back else self._find_platform(
@@ -676,6 +681,7 @@ class X2SimNode(Node):
             hit = back or front
             if hit:
                 gx, gy, top = hit
+                self._pose_surface = top
                 n = math.hypot(gx, gy) or 1.0
                 # 감지 지점보다 0.10m 더 깊이 걸터앉기
                 glide = (gx * (1 + 0.10 / n), gy * (1 + 0.10 / n))
@@ -699,6 +705,7 @@ class X2SimNode(Node):
                 gx, gy, top = found     # 감지 지점보다 0.30m 안쪽까지
                 n = math.hypot(gx, gy) or 1.0
                 glide = (gx * (1 + 0.30 / n), gy * (1 + 0.30 / n))
+                self._pose_surface = top
             else:
                 glide, top = (0.45 * c, 0.45 * s), 0.0
             # +0.22: 몸이 매트리스에 파묻히면 접촉 지터로 천장 시야가
@@ -725,6 +732,12 @@ class X2SimNode(Node):
         self.posture = posture
         if hasattr(self, 'pub_posture_state'):
             self.pub_posture_state.publish(String(data=posture))
+        if hasattr(self, 'pub_posture_info'):
+            # 착석/눕기 표면 높이 — "가구에 앉았다" 주장의 근거 데이터
+            self.pub_posture_info.publish(String(data=json.dumps(
+                {'posture': posture,
+                 'surface_h': round(getattr(self, '_pose_surface', 0.0),
+                                    2)})))
         self.get_logger().info(f'자세 전환 시작: {posture} (1.5s 램프'
                                + (', 반턴' if dyaw else '') + ')')
 
@@ -1007,7 +1020,7 @@ class X2SimNode(Node):
             door_names = set(getattr(self, 'doors', {}) or {})
             self.pub_costmap.publish(String(data=json.dumps(
                 [[z[0], z[1], z[2], z[3], z[4],
-                  1 if z[6] in door_names else 0]
+                  1 if z[6] in door_names else 0, round(z[5], 2)]
                  for z in self.block_zones])))
 
     def _set_door(self, name, state, rebuild=True):

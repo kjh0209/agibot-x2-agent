@@ -145,7 +145,7 @@ WORLDS['home'] = {
     'desc': '집 (거실+주방+스튜디오+사무실 통합 공간 — 전부 걸어서 이동)',
     # 기능형 문 — closed: 통로를 가로막음(충돌+이동 차단),
     # open: 문설주 쪽으로 접힘(시각만). open_door/close_door로 조작.
-    'doors': [
+    'door_defs': [
         {'name': 'door_lk', 'closed_pos': (4.1, 0.0),
          'size': (0.68, 0.03, 0.92), 'open_pos': (3.43, 0.66),
          'init': 'open'},
@@ -311,7 +311,7 @@ WORLDS['home'] = {
 #       동쪽 침실(침대·옷장). 시작점 (0,0) = 라운지 남측.
 WORLDS['newhouse'] = {
     'desc': '새 집 (미지 공간 — 탐색·학습 모드)',
-    'doors': [
+    'door_defs': [
         {'name': 'nh_door_w', 'closed_pos': (-1.2, 0.0),
          'size': (0.03, 0.63, 0.90), 'open_pos': (-0.57, -0.68),
          'init': 'closed'},
@@ -401,7 +401,7 @@ WORLDS['newhouse'] = {
 # 전부 개방 어휘 VLM 인식의 결과여야 함.
 WORLDS['newoffice'] = {
     'desc': '새 사무실 (미지 공간 2 — 탐색 일반화 검증)',
-    'doors': [
+    'door_defs': [
         {'name': 'no_door', 'closed_pos': (-1.6, 0.0),
          'size': (0.03, 0.58, 0.90), 'open_pos': (-1.02, -0.62),
          'init': 'closed'},

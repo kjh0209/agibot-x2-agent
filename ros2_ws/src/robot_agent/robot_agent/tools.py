@@ -847,6 +847,41 @@ class ToolExecutor:
         self.audit('explore', args, True, summary)
         return {'ok': summary}
 
+    def _approach_nearest_seat(self):
+        """가장 가까운 '앉을 수 있는 가구'(코스트맵 top 0.15~0.55) 옆까지
+        A* 접근 후 가구를 바라보게 정렬. 없거나 이미 옆이면 그냥 통과.
+
+        배경: 앉기 감지 범위(0.7m) 밖에서 sit을 부르면 조용히 바닥에
+        앉고, LLM이 "소파에 앉았다"고 지어내던 사고."""
+        pos = self.node.odom
+        if pos is None:
+            return
+        best = None
+        for z in getattr(self.node, 'costmap', []):
+            if len(z) < 7 or not (0.15 <= z[6] <= 0.55):
+                continue
+            nx = max(z[0] - z[2], min(pos[0], z[0] + z[2]))
+            ny = max(z[1] - z[3], min(pos[1], z[1] + z[3]))
+            d = math.hypot(nx - pos[0], ny - pos[1])
+            if best is None or d < best[0]:
+                best = (d, nx, ny, z)
+        if best is None or best[0] <= 0.55 or best[0] > 3.0:
+            return                       # 없음/이미 옆/너무 멂 → 그대로
+        d, ex, ey, z = best
+        ux = (pos[0] - ex) / max(d, 0.1)
+        uy = (pos[1] - ey) / max(d, 0.1)
+        # 0.32m: 내비 통과 반경(0.35)과 합친 최악 거리 0.67m가
+        # 착석 감지 원뿔(0.7m) 안에 들도록 (0.45였을 땐 4cm 초과로
+        # 의자 옆 바닥에 앉는 실측 사고)
+        stand = (ex + 0.32 * ux, ey + 0.32 * uy)
+        wps = self._plan_path(pos, stand)
+        if wps is None:
+            return
+        ok, _ = self._navigate(wps, timeout=40.0)
+        if ok:
+            p2 = self.node.odom or stand
+            self._rotate_to(math.atan2(ey - p2[1], ex - p2[0]))
+
     def _cost_pen(self, x, y, ignore_doors=False):
         """코스트맵(실기 SLAM 코스트맵 대응물) 기준 (x,y)의 관통량.
 
@@ -876,11 +911,22 @@ class ToolExecutor:
         def cell(x, y):
             return (round(x / res), round(y / res))
 
+        # 바닥의 동적 물체(공 등)도 계획상 회피 — "공을 밟고 지나감"
+        # 방지. 물리 게이팅에는 넣지 않는다(굴러오는 공에 이동이 잠기는
+        # 역효과 방지 — 계획만 피해 가면 충분).
+        obst = [(o['x'], o['y']) for n2, o in
+                (self.node.objects or {}).items()
+                if n2 != self.node.carrying and o.get('z', 1) < 0.35]
+
         def free(c):
-            # 문은 열 수 있으므로 계획상 통과 허용 (닫혀 있으면 내비가
-            # 문 앞에서 자동으로 연다)
-            return self._cost_pen(c[0] * res, c[1] * res,
-                                  ignore_doors=True) <= 0.0
+            x, y = c[0] * res, c[1] * res
+            # 문은 열 수 있으므로 계획상 통과 허용
+            if self._cost_pen(x, y, ignore_doors=True) > 0.0:
+                return False
+            for ox, oy in obst:
+                if math.hypot(x - ox, y - oy) < 0.28:
+                    return False
+            return True
 
         def step_cost(c):
             # ★여유 폭 선호: 경계에 바싹 붙은 셀은 비용 가산 — 좁은
@@ -1443,18 +1489,33 @@ class ToolExecutor:
         return False
 
     def sit_down(self):
-        """앉기 — 실기 McAction SIT_DOWN_DEFAULT(2000)와 동일 의미론."""
+        """앉기 — 실기 McAction SIT_DOWN_DEFAULT(2000)와 동일 의미론.
+
+        시뮬: 근처(3m)에 앉을 가구가 있으면 자동 접근 후 앉고,
+        착석 표면(가구 높이/바닥)을 데이터로 보고한다."""
         try:
+            if ROBOT_TARGET == 'sim':
+                # ★접근이 먼저 — 접근(보행)이 모드를 LOCOMOTION으로
+                # 바꾸므로 STAND 전환은 그 뒤여야 함 (순서 바뀌면
+                # LOCOMOTION→SIT 전이 거부)
+                self._approach_nearest_seat()
             self.ensure_source()
             self.ensure_mode(int(McAction.STAND_DEFAULT))
             self.set_action(int(McAction.SIT_DOWN_DEFAULT))
         except RuntimeError as e:
             self.audit('sit_down', {}, False, str(e))
             return {'error': str(e)}
+        time.sleep(1.8)                  # 램프 완료 + posture_info 수신
         held = f' (들고 있는 것: {self.node.carrying})' \
             if self.node.carrying else ' (빈손)'
-        self.audit('sit_down', {}, True, 'seated')
-        return {'ok': f'앉았음.{held} 앉은 동안 이동 불가 — stand_up으로 일어남'}
+        sh = (getattr(self.node, 'posture_info', {}) or {}).get(
+            'surface_h', 0.0)
+        surface = (f'높이 {sh:.2f}m 가구 위에 걸터앉음' if sh > 0.05
+                   else '★바닥에 제자리 앉음 — 주변에 앉을 가구가 '
+                        '감지되지 않았음. 가구에 앉은 게 아니니 '
+                        '사실대로 말할 것')
+        self.audit('sit_down', {}, True, f'seated surface={sh}')
+        return {'ok': f'{surface}.{held} 이동 불가 — stand_up으로 일어남'}
 
     def stand_up(self):
         """일어서기 — 실기 McAction STAND_UP_DEFAULT(2005). 누운 상태
@@ -1500,12 +1561,18 @@ class ToolExecutor:
                 time.sleep(1.6)          # 기립 램프 완료
         except RuntimeError:
             pass
+        if ROBOT_TARGET == 'sim':
+            self._approach_nearest_seat()   # 침대/소파가 근처면 옆까지
         self.pub_posture.publish(String(data='lie'))
-        time.sleep(1.8)                 # 글라이드+눕기 램프 완료 대기
-        self.audit('lie_down', {}, True, 'lying')
-        return {'ok': ('누웠음 — 시야가 천장을 향한다. 누운 동안 이동 '
-                       '불가, stand_up으로 일어남. 누운 상태에서 '
-                       'upright=false는 정상')}
+        time.sleep(2.0)                 # 글라이드+눕기 램프 완료 대기
+        sh = (getattr(self.node, 'posture_info', {}) or {}).get(
+            'surface_h', 0.0)
+        surface = (f'높이 {sh:.2f}m 가구 위에 누움' if sh > 0.05
+                   else '★바닥에 누움 — 근처에 침대/소파가 감지되지 '
+                        '않았음. 가구 위가 아니니 사실대로 말할 것')
+        self.audit('lie_down', {}, True, f'lying surface={sh}')
+        return {'ok': (f'{surface}. 시야는 천장, 이동 불가, stand_up으로 '
+                       f'일어남. upright=false는 정상')}
 
     def pick_up(self, object_name: str):
         args = {'object_name': object_name}
