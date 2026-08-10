@@ -368,6 +368,15 @@ class X2SimNode(Node):
                 self.groups[g].append(ai)
         self.jname_to_ai = {n: i for i, n in enumerate(self.joint_names)}
 
+        # 착석 강성 벡터 (허리/다리만 kp 5배, kd 2배 — apply_pd에서 사용)
+        self._sit_gain = np.ones(self.model.nu)
+        self._sit_kd_gain = np.ones(self.model.nu)
+        for jname, ai in self.jname_to_ai.items():
+            if any(k in (jname or '') for k in
+                   ('waist', 'hip', 'knee', 'ankle')):
+                self._sit_gain[ai] = 5.0
+                self._sit_kd_gain[ai] = 2.0
+
         mujoco.mj_forward(self.model, self.data)
         self.q_ref = np.array(
             [self.data.qpos[a] for a in self.act_qpos_adr])
@@ -693,7 +702,14 @@ class X2SimNode(Node):
                 ai = self.jname_to_ai.get(jname)
                 if ai is not None:
                     q_target[ai] += delta
-        tau = self.kp * (q_target - q) - self.kd * v
+        kp, kd = self.kp, self.kd
+        if self.posture == 'sit':
+            # 착석 중 허리/다리 강성 상향 — 소파 접촉력이 유연한(kp=120)
+            # 관절을 밀어 카메라가 기울던 문제(허리 0.29rad 편차 실측).
+            # 실기에서는 MC가 자체 자세 제어를 하므로 시뮬 전용 보정.
+            kp = self.kp * self._sit_gain
+            kd = self.kd * self._sit_kd_gain
+        tau = kp * (q_target - q) - kd * v
         self.data.ctrl[:] = np.clip(
             tau, self.model.actuator_ctrlrange[:, 0],
             self.model.actuator_ctrlrange[:, 1]) \
