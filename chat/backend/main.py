@@ -82,6 +82,14 @@ class Bridge(Node):
         self.create_subscription(
             String, '/x2_sim/world',
             lambda m: self.state.__setitem__('world', m.data), latched)
+        # 자세 상태 (stand/sit/lie) — UI 배지가 '누움'을 '이상'으로
+        # 표시하지 않도록
+        latched_p = QoSProfile(depth=1)
+        latched_p.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.state['posture'] = 'stand'
+        self.create_subscription(
+            String, '/x2_sim/posture_state',
+            lambda m: self.state.__setitem__('posture', m.data), latched_p)
 
         # 라이브 프리뷰(저해상 고빈도) 우선, 없으면(실기) 메인 카메라 사용
         self._preview_seen = False

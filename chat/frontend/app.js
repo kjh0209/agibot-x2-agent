@@ -58,9 +58,16 @@ function setBadge(id, text, cls) {
 function renderStatus(s) {
   setBadge('b-mode', '모드: ' + (s.mode ?? '?'),
            s.mode && s.mode.startsWith('LOCOMOTION') ? 'warn' : 'ok');
-  if (s.upright !== undefined)
-    setBadge('b-upright', s.upright ? '자세: 직립' : '자세: 이상!',
-             s.upright ? 'ok' : 'err');
+  if (s.upright !== undefined) {
+    // 자세명 우선 표시 — 누움/앉음은 정상 상태 ('이상'은 진짜 이상만)
+    if (s.posture === 'lie')
+      setBadge('b-upright', '자세: 누움', 'ok');
+    else if (s.posture === 'sit')
+      setBadge('b-upright', '자세: 앉음', 'ok');
+    else
+      setBadge('b-upright', s.upright ? '자세: 직립' : '자세: 이상!',
+               s.upright ? 'ok' : 'err');
+  }
   if (s.position)
     setBadge('b-pos', `위치: (${s.position.x}, ${s.position.y})`);
   if (s.battery_pct !== undefined) {
