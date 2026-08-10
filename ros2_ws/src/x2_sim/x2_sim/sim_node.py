@@ -634,7 +634,12 @@ class X2SimNode(Node):
 
     # ---------- 메인 루프 ----------
     def _robot_prop_contact(self) -> bool:
-        """로봇 geom과 소품 geom 사이의 접촉 존재 여부."""
+        """로봇 geom과 소품 geom 사이의 접촉 존재 여부.
+
+        차단 대상 접촉의 법선(소품→로봇)을 전부 수집한다
+        (_last_contact_normals) — 탈출 판정은 다중 접촉을 모두 봐야 함."""
+        self._last_contact_normals = []
+        found = False
         for i in range(self.data.ncon):
             c = self.data.contact[i]
             a, b = c.geom1, c.geom2
@@ -651,7 +656,10 @@ class X2SimNode(Node):
                 continue              # 팔 스침은 차단 사유 아님 (회전 교착 방지)
             # 접촉 법선 (소품→로봇 방향) — 탈출 이동 허용 판정에 사용
             n = np.array(c.frame[0:3])
-            self._last_contact_normal = n if a_prop else -n
+            self._last_contact_normals.append(n if a_prop else -n)
+            if found:
+                continue              # 이름 로깅은 첫 접촉만
+            found = True
             self._last_contact_pair = (
                 mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM,
                                   a if a_prop else b) or '?',
@@ -659,8 +667,7 @@ class X2SimNode(Node):
                                   other)
                 or mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY,
                                      other_body) or '?')
-            return True               # 상대가 로봇 바디 → 접촉
-        return False
+        return found                  # 하나라도 로봇↔소품 접촉이면 True
 
     def tick(self):
         with self.state_lock:
@@ -676,16 +683,28 @@ class X2SimNode(Node):
                 # (직전 스텝이 아니라 승인 위치 기준이어야 접촉이 지속되는
                 #  동안에도 계속 차단된다 — 진입-순간만 보면 뚫고 지나감)
                 if hit and not self._contact_prev:
-                    # ★탈출 허용: 접촉 법선(소품→로봇) 방향으로 멀어지는
-                    # 이동은 승인. 도킹·착석이 '접촉 중' 상태를 만들면
+                    # ★탈출 허용: 도킹·착석이 '접촉 중' 상태를 만들면
                     # 종전 규칙은 탈출 이동까지 롤백해 영구 교착이었음
-                    # (소파에서 일어선 뒤 못 걷던 사고 — sofa_seat↔hip).
-                    # _contact_prev는 갱신하지 않아 '접촉을 향한' 이동은
-                    # 계속 차단된다.
+                    # (소파에서 일어선 뒤 못 걷던 사고). 모든 차단 접촉에
+                    # 대해 아래 중 하나면 이동 승인:
+                    #   · 법선이 거의 수직(윗면 겹침 — 소파 위에 서 있는
+                    #     경우): 수평 이동으로는 더 파고들 수 없음
+                    #   · 수평 법선과 이동 변위의 내적 ≥ 0 (멀어지거나
+                    #     벽면을 따라 미끄러지는 이동)
+                    # 하나라도 '접촉을 향한' 수평 이동이면 롤백.
+                    # _contact_prev는 갱신하지 않음 (진입은 계속 차단).
                     disp = self.base_xyz[:2] - prev_xyz[:2]
-                    n = getattr(self, '_last_contact_normal', None)
-                    if n is not None and float(
-                            disp[0] * n[0] + disp[1] * n[1]) > 1e-7:
+                    normals = getattr(self, '_last_contact_normals', [])
+                    ok_escape = bool(normals)
+                    for n in normals:
+                        nxy = math.hypot(n[0], n[1])
+                        if nxy < 0.3:
+                            continue          # 수직 접촉 — 수평 이동 무해
+                        if disp[0] * n[0] + disp[1] * n[1] >= -1e-7:
+                            continue          # 멀어짐/평행 — 허용
+                        ok_escape = False
+                        break
+                    if ok_escape:
                         continue
                     self.base_xyz[:] = prev_xyz
                     self.base_yaw = prev_yaw
