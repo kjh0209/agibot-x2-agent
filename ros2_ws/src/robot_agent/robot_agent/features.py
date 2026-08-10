@@ -112,7 +112,7 @@ def body_facts(target: str = None) -> str:
         lines.append(
             '- 작은 물체는 집고(pick_up) 내려놓을(put_down) 수 있다. 집을 수 있는\n'
             '  물체와 거리는 상태의 nearby_objects_dist_m에 있다(영문 이름 사용:\n'
-            '  apple, mug 등 — 사용자가 "사과"라고 하면 apple로 매핑). 0.95m보다\n'
+            '  apple, mug 등 — 사용자가 "사과"라고 하면 apple로 매핑). 1.05m보다\n'
             '  멀면 먼저 move로 접근한다. 들고 있는 것은 holding에 표시된다.\n'
             '  한 번에 하나만 들 수 있다.')
     else:

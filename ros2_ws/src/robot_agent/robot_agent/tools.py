@@ -882,6 +882,14 @@ class ToolExecutor:
             return self._cost_pen(c[0] * res, c[1] * res,
                                   ignore_doors=True) <= 0.0
 
+        def step_cost(c):
+            # ★여유 폭 선호: 경계에 바싹 붙은 셀은 비용 가산 — 좁은
+            # 협곡(폭 0.5m 미만)보다 넓은 통로를 고르게 한다. 협곡
+            # 추적은 경계에 긁혀 속도가 죽고 watchdog에 걸림 (실측).
+            slack = -self._cost_pen(c[0] * res, c[1] * res,
+                                    ignore_doors=True)
+            return res + (0.6 * res if slack < 0.15 else 0.0)
+
         s, g = cell(sx, sy), cell(gx, gy)
         if not free(g):
             # 목표가 가구 여유 구역 안(접근 등록 지점 등)이면 주변
@@ -914,14 +922,15 @@ class ToolExecutor:
                 while came[path[-1]] is not None:
                     path.append(came[path[-1]])
                 path.reverse()
-                wps = [(c[0] * res, c[1] * res) for c in path[2::3]]
+                # 0.4m 간격 — 0.6m는 좁은 통로에서 코너를 깎았음
+                wps = [(c[0] * res, c[1] * res) for c in path[1::2]]
                 wps.append((gx, gy))
                 return wps
             for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 nxt = (cur[0] + dx, cur[1] + dy)
                 if nxt in cost or not free(nxt):
                     continue
-                cost[nxt] = cost[cur] + res
+                cost[nxt] = cost[cur] + step_cost(nxt)
                 came[nxt] = cur
                 heappush(openq, (cost[nxt]
                                  + math.hypot(nxt[0] - g[0], nxt[1] - g[1])
@@ -974,7 +983,8 @@ class ToolExecutor:
         # 접근점 후보: 물체 주위 0.55~0.8m 링 중 ★코스트맵상 자유 지점만
         # (가구 발자국 안 후보에 45초씩 낭비하던 실측 사고 방지)
         cands = []
-        for r in (0.55, 0.7, 0.85):
+        for r in (0.55, 0.7, 0.85, 1.0):   # 1.0: 도달 1.05m 내 최원거리
+            # — 가구 여유 구역 밖 남측 후보 등 '가까운 면'을 열어준다
             for k in range(12):
                 a = k * math.pi / 6
                 p = (tx + r * math.cos(a), ty + r * math.sin(a))
@@ -1025,7 +1035,7 @@ class ToolExecutor:
         d = math.hypot(tx - p2[0], ty - p2[1])
         took = time.monotonic() - t0
         result = (f'{object_name} 근처 도착 — 거리 {d:.2f}m '
-                  f'({took:.0f}초). 0.95m 이내면 pick_up 가능')
+                  f'({took:.0f}초). 1.05m 이내면 pick_up 가능')
         self.audit('go_to_object', args, True, result)
         return {'ok': result}
 
@@ -1175,7 +1185,7 @@ class ToolExecutor:
         n_wp = len(waypoints)
         for i, (wx, wy) in enumerate(waypoints):
             # 중간 웨이포인트는 느슨하게 통과(0.5m), 최종 목적지만 정밀(0.35m)
-            radius = 0.35 if i == n_wp - 1 else 0.5
+            radius = 0.35 if i == n_wp - 1 else 0.4
             retried = 0
             door_tried = False
             best_err = None
@@ -1531,7 +1541,7 @@ class ToolExecutor:
             return {'ok': f'{name}을(를) 집었음. 들고 이동 가능'}
         if 'too_far' in result:
             dist = result.rsplit(':', 1)[-1]
-            msg = (f'{name}이(가) 너무 멂 (거리 {dist}m, 도달 반경 0.95m) '
+            msg = (f'{name}이(가) 너무 멂 (거리 {dist}m, 도달 반경 1.05m) '
                    f'— 먼저 move로 가까이 접근 후 재시도')
         elif 'hands_full' in result:
             msg = '손이 차 있음 — put_down 먼저'

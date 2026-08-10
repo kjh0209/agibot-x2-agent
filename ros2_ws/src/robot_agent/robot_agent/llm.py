@@ -208,7 +208,7 @@ ALL_TOOLS = [
     {
         'name': 'pick_up',
         'description': ('물체를 집는다. 상태의 nearby_objects_dist_m에 있는 '
-                        '영문 이름 사용. 0.95m 이내여야 하며 멀면 먼저 '
+                        '영문 이름 사용. 1.05m 이내여야 하며 멀면 먼저 '
                         'move로 접근. 한 번에 하나만.'),
         'input_schema': {
             'type': 'object',

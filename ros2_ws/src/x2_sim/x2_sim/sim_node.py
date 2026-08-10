@@ -543,7 +543,9 @@ class X2SimNode(Node):
         self.get_logger().info(f'월드 전환 완료: {name}')
 
     # ---------- 집기/놓기 (시뮬 전용) ----------
-    GRASP_RANGE = 0.95   # 베이스 기준 도달 반경 (m)
+    GRASP_RANGE = 1.05   # 베이스 기준 도달 반경 (m) — 7DOF 팔을
+    # 앞으로 뻗는 자세 기준. 0.95는 침대 남측(0.97m)에서 못 집어
+    # 좁은 협곡으로 빙 돌게 만들었음 (fetch 지연의 마지막 조각)
 
     def on_grasp(self, msg: String):
         name = msg.data.strip()
@@ -1134,15 +1136,25 @@ class X2SimNode(Node):
             # (옷장-벽 사이 등)에서 모든 방향이 '관통 증가'로 계산돼
             # 갇히는 국소 최소점 함정 방지 (복도 끝 못 나오던 실측 사고).
             # 6cm는 실제 가구 면까지 최소 6cm(낮은 가구)~24cm(벽) 여유.
-            pen_new = self._zone_pen(nx, ny)
             pen_old = self._zone_pen(self.base_xyz[0], self.base_xyz[1])
-            # 얕은 관통(≤6cm) 허용은 '이미 여유 구역 안'일 때만 —
-            # 자유 공간→구역 진입은 여전히 경계(0)에서 차단해 가구/벽에
-            # 다가붙는 '부딪힘' 인상을 만들지 않으면서, 구석 국소 최소점
-            # 함정에선 빠져나올 수 있게 한다.
-            if pen_new <= pen_old + 1e-9 or (
-                    pen_old > 1e-9 and pen_new <= 0.06):
+
+            def _ok(px, py):
+                # 얕은 관통(≤6cm) 허용은 '이미 여유 구역 안'일 때만 —
+                # 자유 공간→구역 진입은 경계(0)에서 차단 (부딪힘 인상
+                # 방지), 구석 국소 최소점 함정에선 탈출 가능.
+                p = self._zone_pen(px, py)
+                return p <= pen_old + 1e-9 or (pen_old > 1e-9
+                                               and p <= 0.06)
+
+            if _ok(nx, ny):
                 self.base_xyz[0] = nx
+                self.base_xyz[1] = ny
+            elif _ok(nx, self.base_xyz[1]):
+                # ★벽면 슬라이딩(축 분해): 전체 스텝이 막혀도 통과 가능한
+                # 성분은 살린다 — 좁은 통로(0.48m 협곡 실측)에서 미세
+                # 횡편차마다 전진까지 기각돼 속도가 죽던 문제의 해법
+                self.base_xyz[0] = nx
+            elif _ok(self.base_xyz[0], ny):
                 self.base_xyz[1] = ny
             elif not self._blocked_logged:
                 self.get_logger().warning(
