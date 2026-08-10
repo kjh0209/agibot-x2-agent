@@ -784,10 +784,17 @@ class ToolExecutor:
         self.audit('explore', args, True, summary)
         return {'ok': summary}
 
-    def _cost_pen(self, x, y):
-        """코스트맵(실기 SLAM 코스트맵 대응물) 기준 (x,y)의 관통량."""
+    def _cost_pen(self, x, y, ignore_doors=False):
+        """코스트맵(실기 SLAM 코스트맵 대응물) 기준 (x,y)의 관통량.
+
+        ignore_doors=True면 닫힌 문 구역을 무시 — 경로 계획은 문을
+        '열 수 있는 장애물'로 보고 통과 계획을 세우고, 실제 통과는
+        내비의 닫힌 문 자동 열기가 처리한다."""
         worst = 0.0
-        for (cx, cy, hx, hy, margin) in getattr(self.node, 'costmap', []):
+        for z in getattr(self.node, 'costmap', []):
+            cx, cy, hx, hy, margin = z[0], z[1], z[2], z[3], z[4]
+            if ignore_doors and len(z) > 5 and z[5]:
+                continue
             dx = max(0.0, abs(x - cx) - hx)
             dy = max(0.0, abs(y - cy) - hy)
             pen = margin - math.hypot(dx, dy)
@@ -807,11 +814,31 @@ class ToolExecutor:
             return (round(x / res), round(y / res))
 
         def free(c):
-            return self._cost_pen(c[0] * res, c[1] * res) <= 0.0
+            # 문은 열 수 있으므로 계획상 통과 허용 (닫혀 있으면 내비가
+            # 문 앞에서 자동으로 연다)
+            return self._cost_pen(c[0] * res, c[1] * res,
+                                  ignore_doors=True) <= 0.0
 
         s, g = cell(sx, sy), cell(gx, gy)
         if not free(g):
-            return None
+            # 목표가 가구 여유 구역 안(접근 등록 지점 등)이면 주변
+            # 자유 셀로 완화 (최대 0.6m)
+            found = None
+            for r in range(1, 4):
+                for dx in range(-r, r + 1):
+                    for dy in range(-r, r + 1):
+                        c = (g[0] + dx, g[1] + dy)
+                        if free(c):
+                            found = c
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if found is None:
+                return None
+            g = found
+            gx, gy = g[0] * res, g[1] * res
         openq = [(0.0, s)]
         came = {s: None}
         cost = {s: 0.0}
@@ -947,30 +974,24 @@ class ToolExecutor:
             return {'error': msg}
         tx, ty = entry['pos']
         pos = self.node.odom or (0.0, 0.0)
-        cells = set(lm['cells'])
-        start_c = self._cell(*pos)
-        cells.add(start_c)
-        goal_c = self._cell(tx, ty)
-        if goal_c not in cells:
-            goal_c = min(cells, key=lambda c: (c[0] - goal_c[0]) ** 2
-                         + (c[1] - goal_c[1]) ** 2)
-        path = self._bfs_cells(cells, start_c, goal_c)
-        wps = []
-        if path is None:
-            # 현재 위치가 학습 셀과 단절(탐색 때 안 가본 곳) —
-            # 최근접 학습 셀로 먼저 이동(앵커) 후 그 셀에서 경로 탐색.
-            # 직선 폴백은 문틀을 깎다 스턱되는 원인이라 금지.
-            anchor = min(lm['cells'],
-                         key=lambda c: (c[0] * self.CELL - pos[0]) ** 2
-                         + (c[1] * self.CELL - pos[1]) ** 2, default=None)
-            if anchor is not None:
-                wps.append((anchor[0] * self.CELL, anchor[1] * self.CELL))
-                path = self._bfs_cells(cells, anchor, goal_c)
-        if path:
-            # 전 셀 경유 — 건너뛰기(직선화)는 문틀 모서리를 깎아 스턱됨
-            wps += [(c[0] * self.CELL, c[1] * self.CELL)
-                    for c in path[1:]]
-        wps.append((float(tx), float(ty)))
+        # ★코스트맵 A*로 최단 경로 (실기 Nav2 대응). 종전의 '가본 셀만
+        # 밟기'는 커버리지가 한 줄이면 경로도 그 줄을 따라 뱀처럼
+        # 우회했고, 근처에 셀이 없으면 앵커 직행이 가구에 부딪혔음
+        # (침실→복도가 한참 걸리던 원인). 셀은 탐색 커버리지 추적 전용.
+        wps = self._plan_path(pos, (float(tx), float(ty)))
+        if wps is None:
+            # 코스트맵 부재 등 폴백: 가본 셀 BFS
+            cells = set(lm['cells'])
+            start_c = self._cell(*pos)
+            cells.add(start_c)
+            goal_c = self._cell(tx, ty)
+            if goal_c not in cells:
+                goal_c = min(cells, key=lambda c: (c[0] - goal_c[0]) ** 2
+                             + (c[1] - goal_c[1]) ** 2)
+            path = self._bfs_cells(cells, start_c, goal_c)
+            wps = ([(c[0] * self.CELL, c[1] * self.CELL)
+                    for c in path[1:]] if path else [])
+            wps.append((float(tx), float(ty)))
         t0 = time.monotonic()
         ok, detail = self._navigate(wps, timeout=120.0)
         if ok:

@@ -1002,8 +1002,10 @@ class X2SimNode(Node):
         # 실시간 구축하는 정보라 '지도 유출'이 아님). 에이전트의 경로
         # 계획(A*)이 사용. latched: 문 토글 등 갱신 시마다 재발행.
         if hasattr(self, 'pub_costmap'):
+            door_names = set(getattr(self, 'doors', {}) or {})
             self.pub_costmap.publish(String(data=json.dumps(
-                [[z[0], z[1], z[2], z[3], z[4]]
+                [[z[0], z[1], z[2], z[3], z[4],
+                  1 if z[6] in door_names else 0]
                  for z in self.block_zones])))
 
     def _set_door(self, name, state, rebuild=True):
