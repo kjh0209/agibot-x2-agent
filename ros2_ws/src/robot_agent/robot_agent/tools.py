@@ -849,6 +849,62 @@ class ToolExecutor:
         '규칙: 확실할 때만 yes. 비슷하지만 다른 가구면 no + actual에 '
         '실제 이름.')
 
+    VLM_ROOM_PROMPT = (
+        '실내 로봇이 제자리에서 90°씩 돌며 찍은 4방향 프레임이다. 이 '
+        '공간의 종류를 판단하라.\n'
+        '★핵심 가구 증거 기반 규칙: 침실=침대가 실제로 보일 때만, '
+        '주방=싱크대/조리대/냉장고, 사무실=책상+사무 가구, 거실=소파/'
+        'TV/거실장, 다이닝=식탁+의자들, 회의실=큰 테이블+여러 의자, '
+        '창고=선반/박스 위주, 욕실=변기/세면대, 복도=좁은 통로. 해당 '
+        '증거 가구가 안 보이면 반드시 "모름".\n'
+        'JSON만 출력: {"room": "한 단어", '
+        '"evidence": ["근거 가구 한 단어씩"]}')
+
+    def _classify_room(self):
+        """제자리 4방향 파노라마로 공간 종류 판정 — (라벨 or None).
+
+        증거 가구가 없으면 VLM이 '모름'을 내게 강제 — 방 라벨 검증의
+        기준 판정자."""
+        base_yaw = self.node.yaw_rad()
+        frames = []
+        for k in range(4):
+            if self._stop_requested:
+                return None
+            self._rotate_to(base_yaw + k * (math.pi / 2.0), timeout=7.0)
+            time.sleep(0.2)
+            f = getattr(self.node, 'latest_preview', None)
+            if f is not None:
+                frames.append(f)
+        if not frames:
+            return None
+        try:
+            import anthropic
+            if not hasattr(self, '_vlm'):
+                self._vlm = anthropic.Anthropic()
+            content = []
+            for i, f in enumerate(frames):
+                content.append({'type': 'text', 'text': f'[프레임 {i+1}]'})
+                content.append({'type': 'image', 'source': {
+                    'type': 'base64', 'media_type': 'image/jpeg',
+                    'data': base64.standard_b64encode(f).decode()}})
+            content.append({'type': 'text', 'text': self.VLM_ROOM_PROMPT})
+            r = self._vlm.messages.create(
+                model='claude-haiku-4-5', max_tokens=150,
+                messages=[{'role': 'user', 'content': content}])
+            txt = ''.join(b.text for b in r.content if b.type == 'text')
+            txt = txt[txt.find('{'):txt.rfind('}') + 1]
+            d = json.loads(txt)
+            label = self._clean_label(d.get('room') or '모름')
+            ev = d.get('evidence') or []
+            self.audit('vlm_room', {}, True, f'{label} ev={ev}')
+            if label in ('모름', '') or label in self.LABEL_BLACKLIST \
+                    or not ev:
+                return None
+            return label
+        except Exception as e:
+            self.audit('vlm_room', {}, False, str(e))
+            return None
+
     def _max_clearance_heading(self):
         """12방위 중 장애물까지가 가장 먼 방향 — '트인 쪽 보기'용."""
         best_hd, best_d = self.node.yaw_rad(), -1.0
@@ -954,36 +1010,38 @@ class ToolExecutor:
             self.audit('vlm_scan', {'frames': len(frames)}, False, str(e))
             return
         pos = self.node.odom or (0.0, 0.0)
+        # ---- 방 라벨: ★스캔당 1표 (프레임당 1표는 한 번의 스캔이
+        # 같은 답 4표를 던져 '2회 일치'가 사실상 1회 추측으로 뚫리던
+        # 결함 — '침실' 오라벨 확정의 원인). 4프레임 다수 답을 이번
+        # 스캔의 단일 투표로 삼고, ★서로 다른 위치(0.8~3.5m)의 독립
+        # 2표가 모여야 등록.
+        room_answers = [self._clean_label(r.get('room') or '모름')
+                        for r in results if isinstance(r, dict)]
+        room_answers = [r for r in room_answers
+                        if r and r != '모름'
+                        and r not in self.LABEL_BLACKLIST]
+        if room_answers:
+            room = max(set(room_answers), key=room_answers.count)
+            votes = lm.setdefault('room_votes', {}).setdefault(room, [])
+            independent = any(
+                0.8 <= math.hypot(v[0] - pos[0], v[1] - pos[1]) <= 3.5
+                for v in votes)
+            votes.append([round(pos[0], 2), round(pos[1], 2)])
+            if independent and room not in lm['rooms']:
+                # 위치 = 지금 서 있는 지점(보행 보장), 방향 = 트인 쪽
+                px, py = round(pos[0], 2), round(pos[1], 2)
+                lm['rooms'][room] = [px, py]
+                lm['places'].setdefault(
+                    room, {'pos': [px, py],
+                           'yaw': round(
+                               self._max_clearance_heading(), 2)})
+                self.node.notify_event(
+                    f'탐사: 여기는 {room} (독립 2회 일치 → 등록, 최종 '
+                    f'검증 대기)')
         approach = None                  # (가구명, yaw) — 스캔 후 1건 접근
         for (yaw, _f), res in zip(frames, results):
             if not isinstance(res, dict):
                 continue
-            room = self._clean_label(res.get('room') or '모름')
-            if room and room != '모름' and room not in self.LABEL_BLACKLIST:
-                # ★다수결 등록 — 방 라벨은 한 프레임 추측으로 확정하지
-                # 않고, 3m 내에서 2회 이상 같은 답이 나와야 등록
-                # (문 너머로 본 옆방을 현 위치 라벨로 박던 오류 완화)
-                votes = lm.setdefault('room_votes', {}).setdefault(
-                    room, [])
-                votes.append([round(pos[0], 2), round(pos[1], 2)])
-                near = [v for v in votes
-                        if math.hypot(v[0] - pos[0], v[1] - pos[1]) < 3.0]
-                if len(near) >= 2 and room not in lm['rooms']:
-                    # ★위치 = 지금 서 있는 지점 — 확정 투표 순간의 로봇
-                    # 위치라 보행 가능이 보장된다. 투표 중심점은 두 유효
-                    # 지점 '사이'의 가구 위에 떨어질 수 있음 ('방'이
-                    # 소파 뒤에 박혀 코를 박던 실측 사고).
-                    px, py = round(pos[0], 2), round(pos[1], 2)
-                    lm['rooms'][room] = [px, py]
-                    # 도착 방향 = 시야가 가장 트인 쪽 — 도착 첫 화면이
-                    # 쿠션/벽 클로즈업이 되지 않게
-                    lm['places'].setdefault(
-                        room, {'pos': [px, py],
-                               'yaw': round(
-                                   self._max_clearance_heading(), 2),
-                               'verified': True})
-                    self.node.notify_event(
-                        f'탐사: 여기는 {room} (2회 관측 일치 → 확정)')
             for o in (res.get('objects') or []):
                 o = self._clean_label(o)
                 if o and o not in lm['objects_seen']:
@@ -1226,7 +1284,36 @@ class ToolExecutor:
                 blocked.append(target)
                 continue
             _scan_here()
-        # ---- 3단계: 등록 라벨 전수 현장 검증 (가짜 라벨 소거) ----
+        # ---- 3단계a: 방 라벨 재검증 (매 실행 — 방은 항상 재확인) ----
+        # 4프레임 파노라마 + 증거 기반 판정으로 저장 라벨과 대조.
+        # 다르면 개명, '모름'이면(증거 가구 없음) 라벨 유지하되 미확정
+        # 표시 없이 넘어감 — 스캔4의 오라벨('침실'인데 사무실)이 지도에
+        # 눌러앉지 못하게 하는 관문.
+        for room in list(lm['rooms'].keys()):
+            if self._stop_requested or time.monotonic() > t_end + 240:
+                break
+            entry = lm['places'].get(room)
+            rp = entry['pos'] if entry else lm['rooms'][room]
+            pos = self.node.odom or (0.0, 0.0)
+            wps = self._plan_path(pos, (float(rp[0]), float(rp[1])))
+            if wps is None:
+                continue
+            ok_nav, _ = self._navigate(wps, timeout=60.0)
+            if not ok_nav:
+                continue
+            label = self._classify_room()
+            if label is None or label == room:
+                if label == room:
+                    self.node.notify_event(f'검증: 방 {room} 확인됨')
+                continue
+            # 개명 (대상이 이미 있으면 병합 — 항목 제거)
+            lm['rooms'][label] = lm['rooms'].pop(room)
+            pl = lm['places'].pop(room, None)
+            if pl is not None and label not in lm['places']:
+                lm['places'][label] = pl
+            self.node.notify_event(f'검증: 방 라벨 정정 {room} → {label}')
+
+        # ---- 3단계b: 등록 라벨 전수 현장 검증 (가짜 라벨 소거) ----
         # 각 가구 장소를 재방문해 실제로 보이는지 확인 — 확인 실패는
         # 정정 또는 제거. '한 번 본 추측'이 최종 지도에 남지 않게 하는
         # 완전 탐사의 품질 관문.
@@ -1687,7 +1774,10 @@ class ToolExecutor:
                     for c in path[1:]] if path else [])
             wps.append((float(tx), float(ty)))
         t0 = time.monotonic()
-        ok, detail = self._navigate(wps, timeout=120.0)
+        # 방(공간) 목적지는 '구역'이라 도착 반경을 넓게 — 마지막 20cm
+        # 정밀 도달에 집착하다 벽 앞에서 '막혔다'며 실패하던 것 방지
+        fr = 0.55 if key in lm.get('rooms', {}) else 0.35
+        ok, detail = self._navigate(wps, timeout=120.0, final_radius=fr)
         if ok:
             if entry.get('yaw') is not None:
                 self._rotate_to(entry['yaw'])
@@ -1784,7 +1874,7 @@ class ToolExecutor:
                       f'({pos[0]:.1f}, {pos[1]:.1f})'}
 
     # ---------- 보행 내비게이션 (home 월드: 진짜 걸어서 이동) ----------
-    def _navigate(self, waypoints, timeout=90.0):
+    def _navigate(self, waypoints, timeout=90.0, final_radius=0.35):
         """웨이포인트를 향해 회전→직진 반복 (velocity 명령만 사용 —
         실기에서 SLAM 목적지 없이 걷는 방식과 동일). 걷는 과정 전체가
         카메라에 보인다. stop/하드정지로 언제든 중단 가능."""
@@ -1800,7 +1890,7 @@ class ToolExecutor:
         n_wp = len(waypoints)
         for i, (wx, wy) in enumerate(waypoints):
             # 중간 웨이포인트는 느슨하게 통과(0.5m), 최종 목적지만 정밀(0.35m)
-            radius = 0.35 if i == n_wp - 1 else 0.4
+            radius = final_radius if i == n_wp - 1 else 0.4
             retried = 0
             door_tried = False
             best_err = None
