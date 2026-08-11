@@ -807,8 +807,12 @@ class ToolExecutor:
             for o in (res.get('objects') or []):
                 o = self._clean_label(o)
                 if o and o not in lm['objects_seen']:
+                    # yaw = 그 물체를 본 프레임의 시선 방향 — 나중에
+                    # go_to_object 폴백이 이 지점에 가서 이 방향을
+                    # 보면 물체가 다시 시야에 들어온다
                     lm['objects_seen'][o] = {
-                        'near': [round(pos[0], 2), round(pos[1], 2)]}
+                        'near': [round(pos[0], 2), round(pos[1], 2)],
+                        'yaw': round(yaw, 2)}
             for fname in (res.get('furniture') or []):
                 fname = self._clean_label(fname)
                 if fname in self.LABEL_BLACKLIST:
@@ -1066,6 +1070,36 @@ class ToolExecutor:
         args = {'object_name': object_name}
         obj = self.node.objects.get(object_name)
         if obj is None:
+            # 폴백: 탐색(explore) 때 VLM이 본 물체 — 정확한 물체 좌표는
+            # 없지만 '그 물체를 봤던 지점+시선 방향'이 학습 지도에 있음.
+            # 그 지점으로 걸어가 그 방향을 보면 물체가 다시 시야에 든다
+            # (스캔 월드의 가구/화분 등 메시 일부인 물체 대응 — 범용).
+            lm = self._learned(self.node.current_world)
+            seen = lm.get('objects_seen') or {}
+            key = None
+            q = str(object_name).strip()
+            for k in seen:
+                if k == q or q in k or k in q:
+                    key = k
+                    break
+            if key is not None and seen[key].get('near'):
+                nx, ny = seen[key]['near']
+                pos = self.node.odom or (0.0, 0.0)
+                wps = self._plan_path(pos, (float(nx), float(ny)))
+                if wps is None:
+                    wps = [(float(nx), float(ny))]
+                ok, detail = self._navigate(wps, timeout=120.0)
+                if ok:
+                    if seen[key].get('yaw') is not None:
+                        self._rotate_to(float(seen[key]['yaw']))
+                    msg = (f'탐색 때 {key}을(를) 봤던 지점에 도착해 그 '
+                           f'방향을 보고 있음. 정확한 물체 좌표는 아니니 '
+                           f'look으로 실제로 보이는지 확인할 것')
+                    self.audit('go_to_object', args, True, msg)
+                    return {'ok': msg}
+                self.audit('go_to_object', args, False, detail)
+                return {'error': f'{key}을(를) 봤던 지점으로 가는 중 '
+                                 f'문제: {detail}'}
             msg = (f'{object_name!r} 위치를 모름 — 근처에서 감지된 적 '
                    f'없음. 탐색이나 접근이 먼저 필요')
             self.audit('go_to_object', args, False, msg)

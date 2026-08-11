@@ -236,6 +236,17 @@ def load_model_with_camera_and_props(model_path: str,
         fl.size = [(bx1 - bx0) / 2 + 0.5, (by1 - by0) / 2 + 0.5, 0.05]
         fl.pos = [(bx0 + bx1) / 2, (by0 + by1) / 2, -0.05]
         fl.rgba = [1.0, 1.0, 1.0, 0.0]
+        # 어두운 무광 배경 — 기본 하늘 그라데이션(파란 허공)이 스캔
+        # 구멍 너머로 보이면 데모 품질을 해침. '조명 없는 바깥'처럼
+        # 읽히는 어두운 회색 단색으로.
+        sky = spec.add_texture()
+        sky.name = 'scan_sky'
+        sky.type = mujoco.mjtTexture.mjTEXTURE_SKYBOX
+        sky.builtin = mujoco.mjtBuiltin.mjBUILTIN_FLAT
+        sky.rgb1 = [0.055, 0.055, 0.065]
+        sky.rgb2 = [0.055, 0.055, 0.065]
+        sky.width = 32
+        sky.height = 32
 
     model = spec.compile()
     # CPU(OSMesa) 렌더 최적화 — 실측: 그림자맵 4096 + MSAA 4x가 프레임당
@@ -462,8 +473,23 @@ class X2SimNode(Node):
         if sc:
             with open(os.path.join(sc['dir'], 'meta.json')) as fp:
                 smeta = json.load(fp)
-            self._scan_zones = smeta.get('zones', [])
+            self._scan_zones = list(smeta.get('zones', []))
             self._scan_spawn = smeta.get('spawn')
+            # ★경계 봉쇄 — 실제 스캔엔 구멍(미촬영 창/개구부)이 있어
+            # 로봇이 스캔 밖 허공으로 걸어나가는 사고 실측 (탐색이
+            # 허공에서 '사무실'을 학습). bbox 4변을 키 큰 구역으로
+            # 둘러 이동 게이팅·A* 양쪽에서 이탈 차단.
+            bx0, by0, bx1, by1 = smeta['bbox']
+            t = 0.15
+            cx, cy = (bx0 + bx1) / 2, (by0 + by1) / 2
+            hy_full = (by1 - by0) / 2 + 2 * t
+            hx_full = (bx1 - bx0) / 2 + 2 * t
+            self._scan_zones += [
+                [bx0 - t, cy, t, hy_full, 2.0],
+                [bx1 + t, cy, t, hy_full, 2.0],
+                [cx, by0 - t, hx_full, t, 2.0],
+                [cx, by1 + t, hx_full, t, 2.0],
+            ]
 
         # 집기 시스템: 손(오른 손목 끝 링크) + 물체별 freejoint 주소
         self.hand_bid = mujoco.mj_name2id(
@@ -1378,6 +1404,11 @@ class X2SimNode(Node):
         """HQ(640x480) 렌더 + 발행 — _preview_loop(GL 스레드) 전용."""
         with self.state_lock:
             self.renderer.update_scene(self.data, camera=CAMERA_NAME)
+        if getattr(self, '_scan_zones', None):
+            # 스캔 월드: 한쪽 면만 스캔된 벽이 뒷면 컬링으로 '구멍'처럼
+            # 보이는 것 방지 — 양면 렌더
+            self.renderer.scene.flags[
+                mujoco.mjtRndFlag.mjRND_CULL_FACE] = 0
         rgb = self.renderer.render()      # (H, W, 3) uint8
         stamp = self.get_clock().now().to_msg()
 
@@ -1469,6 +1500,9 @@ class X2SimNode(Node):
                     with self.state_lock:
                         r.update_scene(self.data, camera=CAMERA_NAME,
                                        scene_option=opt)
+                    if getattr(self, '_scan_zones', None):
+                        r.scene.flags[
+                            mujoco.mjtRndFlag.mjRND_CULL_FACE] = 0
                     rgb = r.render()
                     # 폐기 렌더러 정리 — 위에서 현 월드 컨텍스트를 이
                     # 스레드에 바인딩한 뒤라, 폐기 컨텍스트는 어느
