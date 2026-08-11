@@ -792,9 +792,30 @@ class ToolExecutor:
         msg.forward_velocity = 0.0
         self.pub_vel.publish(msg)
         pos = self.node.odom
-        lm['places'][name] = {'pos': [round(pos[0], 2), round(pos[1], 2)],
-                              'yaw': round(self.node.yaw_rad(), 2)}
-        self.node.notify_event(f'탐색: {name} 발견 → 장소로 기억함')
+        # ★현장 검증 관문 — 도착해서 실제로 그 가구가 보일 때만 등록.
+        # 종전엔 스캔 프레임의 한 번 추측을 무검증 등록해 '침대'가
+        # 침대 아닌 곳에 박혔음 (사용자 지적: "임의 배치와 다를 게
+        # 없다"). 정정 라벨이 오면 그 이름으로 등록.
+        ok, actual = self._verify_view(name)
+        reg = None
+        if ok:
+            reg = name
+        elif actual and actual not in lm['places']:
+            reg = actual
+        if reg in self.SIT_FURNITURE and not self._has_seat_evidence(
+                pos[0], pos[1]):
+            self.node.notify_event(
+                f'탐사: {reg}?, 앉을 면 증거 없음 — 등록 보류')
+            reg = None
+        if reg:
+            lm['places'][reg] = {
+                'pos': [round(pos[0], 2), round(pos[1], 2)],
+                'yaw': round(self.node.yaw_rad(), 2), 'verified': True}
+            tag = reg if reg == name else f'{name}→{reg} 정정'
+            self.node.notify_event(f'탐사: {tag} 현장 확인 → 장소 등록')
+        else:
+            self.node.notify_event(
+                f'탐사: {name} 현장 확인 실패 — 등록 안 함')
         self._dock(max_dist=0.5, forward=False)   # 물러나 탐색 재개
 
     # 구조물/무의미 라벨 — 장소로 등록하지 않음 (개방 어휘의 노이즈 필터)
@@ -808,15 +829,78 @@ class ToolExecutor:
         return s[:10]
 
     VLM_SCAN4_PROMPT = (
-        '실내 로봇이 제자리에서 90°씩 돌며 찍은 4방향 프레임이다. 단순 '
-        '도형 시뮬레이션이므로 색·형태·크기·배치로 추정하라. 4장을 함께 '
-        '보고 공간을 종합 판단하라.\n'
+        '실내 로봇이 제자리에서 90°씩 돌며 찍은 4방향 프레임이다 '
+        '(실사 또는 시뮬레이션 실내). 4장을 함께 보고 공간을 종합 '
+        '판단하라.\n'
         'JSON 배열만 출력(길이 4, 프레임 순서대로): '
         '[{"room": "공간 종류 한 단어(모르면 \\"모름\\")", '
         '"furniture": ["큰 가구/설비 한 단어씩"], '
         '"objects": ["소형 물체 한 단어씩"]}, ...]\n'
         '규칙: 명사 한 단어(예: 침대, 회의탁자, 정수기 — 예시일 뿐 '
-        '무엇이든 가능). 벽/바닥/문/천장 제외. 확실한 것만.')
+        '무엇이든 가능). 벽/바닥/문/천장 제외. ★확실한 것만 — 애매하면 '
+        '넣지 마라. 어둡거나 흐린 프레임은 비워 두라.')
+
+    VLM_VERIFY_PROMPT = (
+        '실내 로봇 카메라 프레임이다. 질문: 이 화면에 "{label}" '
+        '(가구/설비)이 분명히 보이는가?\n'
+        'JSON만 출력: {{"answer": "yes" 또는 "no", '
+        '"actual": "화면에서 실제로 가장 두드러진 가구/설비 한 단어'
+        '(없으면 \\"없음\\")"}}\n'
+        '규칙: 확실할 때만 yes. 비슷하지만 다른 가구면 no + actual에 '
+        '실제 이름.')
+
+    def _verify_view(self, label):
+        """현장 검증 — 지금 시야에 label이 실제로 보이는가.
+
+        완전 탐사의 라벨을 '한 번 본 추측'에서 '현장 확인된 사실'로
+        승격시키는 관문. 반환: (확인됨, 실제 라벨 or None)."""
+        if ROBOT_TARGET == 'sim':
+            self.pub_render_hq.publish(String(data='verify'))
+        frame = self.node.latest_frame()
+        if frame is None:
+            return False, None
+        try:
+            import anthropic
+            if not hasattr(self, '_vlm'):
+                self._vlm = anthropic.Anthropic()
+            r = self._vlm.messages.create(
+                model='claude-haiku-4-5', max_tokens=120,
+                messages=[{'role': 'user', 'content': [
+                    {'type': 'image', 'source': {
+                        'type': 'base64', 'media_type': 'image/jpeg',
+                        'data': base64.standard_b64encode(
+                            frame).decode()}},
+                    {'type': 'text',
+                     'text': self.VLM_VERIFY_PROMPT.format(
+                         label=label)}]}])
+            txt = ''.join(b.text for b in r.content if b.type == 'text')
+            txt = txt[txt.find('{'):txt.rfind('}') + 1]
+            d = json.loads(txt)
+            ok = str(d.get('answer', '')).strip().lower() == 'yes'
+            actual = self._clean_label(d.get('actual') or '')
+            if actual in ('없음', '') or actual in self.LABEL_BLACKLIST:
+                actual = None
+            self.audit('vlm_verify', {'label': label}, True,
+                       f'ok={ok} actual={actual}')
+            return ok, actual
+        except Exception as e:
+            self.audit('vlm_verify', {'label': label}, False, str(e))
+            return False, None
+
+    # 앉는 가구 어휘 — 물리 교차검증 대상 (라벨이 이들이라 주장하면
+    # 근처에 실제 '앉을 수 있는 면'(코스트맵 top 0.15~0.55)이 있어야
+    # 한다. 언어 의미 기반의 범용 규칙 — 특정 월드 지식 아님)
+    SIT_FURNITURE = {'침대', '소파', '쇼파', '의자', '벤치', '침상'}
+
+    def _has_seat_evidence(self, x, y, radius=1.3):
+        for z in getattr(self.node, 'costmap', []):
+            if len(z) < 7 or not (0.15 <= z[6] <= 0.55):
+                continue
+            nx = max(z[0] - z[2], min(x, z[0] + z[2]))
+            ny = max(z[1] - z[3], min(y, z[1] + z[3]))
+            if math.hypot(nx - x, ny - y) <= radius:
+                return True
+        return False
 
     def _scan_and_register(self, lm, world):
         """제자리 4방향 스캔 — 프레임 4장 선촬영 후 ★VLM 1회 호출.
@@ -864,12 +948,24 @@ class ToolExecutor:
             if not isinstance(res, dict):
                 continue
             room = self._clean_label(res.get('room') or '모름')
-            if room and room != '모름' and room not in lm['rooms']:
-                lm['rooms'][room] = [round(pos[0], 2), round(pos[1], 2)]
-                lm['places'].setdefault(
-                    room, {'pos': [round(pos[0], 2), round(pos[1], 2)],
-                           'yaw': round(yaw, 2)})
-                self.node.notify_event(f'탐색: 여기는 {room}인 것 같음')
+            if room and room != '모름' and room not in self.LABEL_BLACKLIST:
+                # ★다수결 등록 — 방 라벨은 한 프레임 추측으로 확정하지
+                # 않고, 3m 내에서 2회 이상 같은 답이 나와야 등록
+                # (문 너머로 본 옆방을 현 위치 라벨로 박던 오류 완화)
+                votes = lm.setdefault('room_votes', {}).setdefault(
+                    room, [])
+                votes.append([round(pos[0], 2), round(pos[1], 2)])
+                near = [v for v in votes
+                        if math.hypot(v[0] - pos[0], v[1] - pos[1]) < 3.0]
+                if len(near) >= 2 and room not in lm['rooms']:
+                    cx = sum(v[0] for v in near) / len(near)
+                    cy = sum(v[1] for v in near) / len(near)
+                    lm['rooms'][room] = [round(cx, 2), round(cy, 2)]
+                    lm['places'].setdefault(
+                        room, {'pos': [round(cx, 2), round(cy, 2)],
+                               'yaw': round(yaw, 2)})
+                    self.node.notify_event(
+                        f'탐사: 여기는 {room} (2회 관측 일치 → 확정)')
             for o in (res.get('objects') or []):
                 o = self._clean_label(o)
                 if o and o not in lm['objects_seen']:
@@ -1112,6 +1208,46 @@ class ToolExecutor:
                 blocked.append(target)
                 continue
             _scan_here()
+        # ---- 3단계: 등록 라벨 전수 현장 검증 (가짜 라벨 소거) ----
+        # 각 가구 장소를 재방문해 실제로 보이는지 확인 — 확인 실패는
+        # 정정 또는 제거. '한 번 본 추측'이 최종 지도에 남지 않게 하는
+        # 완전 탐사의 품질 관문.
+        furn = [n for n in list(lm['places'].keys())
+                if n not in lm['rooms']
+                and not lm['places'][n].get('verified')]
+        if furn and not self._stop_requested:
+            self.node.notify_event(
+                f'완전 탐사: 미검증 장소 {len(furn)}곳 전수 검증 시작')
+        for name in furn:
+            if self._stop_requested or time.monotonic() > t_end + 240:
+                break                     # 검증 단계는 +4분까지 허용
+            entry = lm['places'].get(name)
+            if entry is None:
+                continue
+            ex, ey = entry['pos']
+            pos = self.node.odom or (0.0, 0.0)
+            wps = self._plan_path(pos, (float(ex), float(ey)))
+            if wps is None:
+                continue
+            ok_nav, _ = self._navigate(wps, timeout=60.0)
+            if not ok_nav:
+                continue
+            if entry.get('yaw') is not None:
+                self._rotate_to(float(entry['yaw']))
+            ok, actual = self._verify_view(name)
+            if ok and (name not in self.SIT_FURNITURE
+                       or self._has_seat_evidence(ex, ey)):
+                entry['verified'] = True
+                self.node.notify_event(f'검증: {name} 현장 확인됨')
+            elif actual and actual not in lm['places']:
+                lm['places'][actual] = dict(entry, verified=True)
+                del lm['places'][name]
+                self.node.notify_event(f'검증: {name} → {actual} 정정')
+            else:
+                del lm['places'][name]
+                self.node.notify_event(
+                    f'검증: {name} 현장 불일치 — 지도에서 제거')
+
         lm['scan_pts'] = [list(p) for p in scan_pts]
         self._save_learned(world)
         slam.save()
@@ -1121,10 +1257,12 @@ class ToolExecutor:
                  ('시간 상한 도달 — 재실행 시 이어서 진행' if
                   time.monotonic() >= t_end else '수렴 완료 — 이 공간은 '
                   '이제 지도가 있는 공간처럼 파악됨'))
+        n_ver = sum(1 for p in lm['places'].values()
+                    if p.get('verified'))
         summary = (f'완전 탐사 종료({dt:.1f}분, {state}) — 지도 '
                    f'{slam.known_area_m2():.0f}㎡, 잔여 도달가능 미지 '
                    f'경계 {fr_left}곳, 방 {sorted(lm["rooms"])}, 장소 '
-                   f'{sorted(lm["places"])}, 물체 '
+                   f'{sorted(lm["places"])} (현장 검증 {n_ver}곳), 물체 '
                    f'{sorted(lm["objects_seen"])}, 스캔 {len(scan_pts)}회')
         self.audit('survey_map', args, True, summary)
         return {'ok': summary}
