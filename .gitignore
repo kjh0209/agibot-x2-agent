@@ -28,3 +28,6 @@ dist/
 # 크래시 코어덤프
 core
 core.*
+
+# 스캔 월드 자산 (재생성 가능 — tools/convert_scan.py, 진행상황 18-7절)
+ros2_ws/assets/scans/

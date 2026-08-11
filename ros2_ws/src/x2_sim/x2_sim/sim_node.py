@@ -14,6 +14,7 @@
 import io
 import json
 import math
+import os
 import threading
 import time
 
@@ -183,6 +184,58 @@ def load_model_with_camera_and_props(model_path: str,
             g.material = 'wood'
             g.rgba = [1.0, 1.0, 1.0, 1.0]
         static_names.append(d['name'])
+
+    # ---------- 스캔 메시 (사진측량 3D — 시각 전용) ----------
+    # tools/convert_scan.py 산출물. 충돌/이동차단은 meta.json의 점유
+    # 구역(_build_world에서 block_zones로 주입)이 담당하므로 메시 자체는
+    # contype 0. 물체가 설 물리 바닥은 투명 박스로 별도 제공.
+    scan = world.get('scan')
+    if scan:
+        sdir = scan['dir']
+        with open(os.path.join(sdir, 'meta.json')) as fp:
+            smeta = json.load(fp)
+        for i, part in enumerate(smeta['parts']):
+            msh = spec.add_mesh()
+            msh.name = f'scan_mesh_{i}'
+            msh.file = os.path.join(sdir, part['obj'])
+            # 평면 파트(창유리 등)는 부피 0 → 컴파일 거부. 시각 전용
+            # 메시라 관성은 무의미 — shell로 지정해 통과
+            msh.inertia = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
+            matname = None
+            if part.get('tex'):
+                tx = spec.add_texture()
+                tx.name = f'scan_tex_{i}'
+                tx.type = mujoco.mjtTexture.mjTEXTURE_2D
+                tx.file = os.path.join(sdir, part['tex'])
+                mat = spec.add_material()
+                mat.name = f'scan_mat_{i}'
+                mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = \
+                    f'scan_tex_{i}'
+                # 사진측량 텍스처엔 촬영 당시 조명이 구워져 있음 — 자체
+                # 발광으로 렌더 조명 의존을 줄이고, 반사광은 꺼서
+                # (스펙큘러 하이라이트가 '젖은 바닥'처럼 보임) 사진 톤 유지
+                mat.emission = float(scan.get('emission', 0.35))
+                mat.specular = 0.05
+                mat.shininess = 0.05
+                mat.reflectance = 0.0
+                matname = mat.name
+            g = wb.add_geom()
+            g.name = f'scan_part_{i}'
+            g.type = mujoco.mjtGeom.mjGEOM_MESH
+            g.meshname = f'scan_mesh_{i}'
+            g.contype = 0
+            g.conaffinity = 0
+            if matname:
+                g.material = matname
+            if part.get('rgba'):
+                g.rgba = part['rgba']
+        bx0, by0, bx1, by1 = smeta['bbox']
+        fl = wb.add_geom()
+        fl.name = 'scan_phys_floor'    # static_names 미등록 → 구역 제외
+        fl.type = GEOM_TYPES['box']
+        fl.size = [(bx1 - bx0) / 2 + 0.5, (by1 - by0) / 2 + 0.5, 0.05]
+        fl.pos = [(bx0 + bx1) / 2, (by0 + by1) / 2, -0.05]
+        fl.rgba = [1.0, 1.0, 1.0, 0.0]
 
     model = spec.compile()
     # CPU(OSMesa) 렌더 최적화 — 실측: 그림자맵 4096 + MSAA 4x가 프레임당
@@ -400,6 +453,18 @@ class X2SimNode(Node):
         self.data = mujoco.MjData(self.model)
         self.world_name = world_name
 
+        # 스캔 월드: 변환기(meta.json)의 점유 구역·스폰 지점 로드.
+        # 구역은 _rebuild_zones에서 block_zones에 합류 → 기하 게이팅·
+        # 코스트맵 A*가 일반 가구 구역과 동일하게 소비 (계약 무변경).
+        self._scan_zones = []
+        self._scan_spawn = None
+        sc = WORLDS[world_name].get('scan')
+        if sc:
+            with open(os.path.join(sc['dir'], 'meta.json')) as fp:
+                smeta = json.load(fp)
+            self._scan_zones = smeta.get('zones', [])
+            self._scan_spawn = smeta.get('spawn')
+
         # 집기 시스템: 손(오른 손목 끝 링크) + 물체별 freejoint 주소
         self.hand_bid = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, 'right_wrist_roll_link')
@@ -480,6 +545,18 @@ class X2SimNode(Node):
                 self._head_gain[ai] = 4.0
                 self._head_kd_gain[ai] = 2.0
 
+        if self._scan_spawn:
+            # 스캔 월드 스폰 — 자유 공간 자동 산출 지점 (0,0이 벽 속일
+            # 수 있는 실제 스캔 좌표계 대응). 방향은 공간 중심(원점 —
+            # 변환기가 XY 중심화함)을 향해 → 첫 화면이 방 내부
+            sx, sy = float(self._scan_spawn[0]), float(self._scan_spawn[1])
+            self.data.qpos[0] = sx
+            self.data.qpos[1] = sy
+            yaw = math.atan2(-sy, -sx)
+            self.data.qpos[3] = math.cos(yaw / 2)
+            self.data.qpos[4] = 0.0
+            self.data.qpos[5] = 0.0
+            self.data.qpos[6] = math.sin(yaw / 2)
         mujoco.mj_forward(self.model, self.data)
         self.q_ref = np.array(
             [self.data.qpos[a] for a in self.act_qpos_adr])
@@ -544,17 +621,30 @@ class X2SimNode(Node):
         self._pen_last = 0.0
         self._blocked_logged = False
 
-        # 렌더러도 월드별 캐시 — 전환마다 OSMesa 컨텍스트를 재생성하던
-        # 것이 전환 지연의 주범(모델 컴파일과 함께). 캐시 스왑이면 즉시.
+        # 렌더러 캐시 — ★LRU 2개 상한. 렌더러 페어(OSMesa/llvmpipe
+        # 컨텍스트)는 월드당 ~0.6-0.9GB를 점유해, 전 월드 예열은 스캔
+        # 월드 추가로 컨테이너 메모리(7.7GB)를 넘겨 OOM 크래시 루프를
+        # 만들었다 (exit 247 실측). 모델 컴파일 캐시(수 MB, 전환 지연의
+        # 주범)는 전량 유지하고, 렌더러만 현재+직전 월드로 제한 —
+        # 재방문 전환은 렌더러 생성(~0.3s)만 지불.
         if not hasattr(self, '_renderer_cache'):
             self._renderer_cache = {}
-        rc = self._renderer_cache.get(world_name)
+        rc = self._renderer_cache.pop(world_name, None)
         if rc is None:
             rc = (mujoco.Renderer(self.model, height=self.cam_size[1],
                                   width=self.cam_size[0]),
                   mujoco.Renderer(self.model, height=self.prev_size[1],
                                   width=self.prev_size[0]))
-            self._renderer_cache[world_name] = rc
+        self._renderer_cache[world_name] = rc     # 재삽입 = 최신 표시
+        while len(self._renderer_cache) > 2:
+            old_name = next(iter(self._renderer_cache))
+            old = self._renderer_cache.pop(old_name)
+            for r in old:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            self.get_logger().info(f'렌더러 캐시 반납: {old_name}')
         self.renderer, self.renderer_prev = rc
         self.get_logger().info(
             f'월드 로드: {world_name} — 소품 {len(prop_names)}개, '
@@ -1047,6 +1137,22 @@ class X2SimNode(Node):
             margin = 0.30 if top >= 0.5 else 0.12
             self.block_zones.append(
                 (float(p[0]), float(p[1]), hx, hy, margin, top, name))
+        # 스캔 월드 점유 구역 — 격자 셀이 이미 표면 범위를 덮으므로
+        # 여유는 가구 구역보다 작게 (통로 폭 보존: 문간 ~0.85m 기준
+        # 0.20+0.20 차감 후에도 A* 자유 셀이 남도록)
+        for k, (cx, cy, hx, hy, top) in enumerate(
+                getattr(self, '_scan_zones', []) or []):
+            margin = 0.20 if top >= 0.5 else 0.10
+            self.block_zones.append(
+                (cx, cy, hx, hy, margin, top, f'scan_{k}'))
+        # 게이팅 벡터화 배열 — 스캔 월드는 구역이 수십~수백 개라
+        # 파이썬 루프(_zone_pen 매 틱 호출)가 병목이 되므로 numpy로
+        za = np.array([z[:6] for z in self.block_zones], dtype=float) \
+            if self.block_zones else np.zeros((0, 6))
+        self._zone_arr = za
+        self._zone_arr_names = [z[6] for z in self.block_zones]
+        self._zone_tall_mask = (za[:, 5] >= 0.5) if len(za) else \
+            np.zeros(0, dtype=bool)
         # 코스트맵 발행 — 실기의 SLAM 코스트맵 대응물 (로봇이 라이다로
         # 실시간 구축하는 정보라 '지도 유출'이 아님). 에이전트의 경로
         # 계획(A*)이 사용. latched: 문 토글 등 갱신 시마다 재발행.
@@ -1097,30 +1203,34 @@ class X2SimNode(Node):
         self._set_door(best[1], 'open' if want == 'open' else 'closed')
 
     def _tall_pen(self, x, y):
-        """키 큰 구역(벽/닫힌 문/장롱 — 윗면 0.5m 이상)만의 관통량."""
-        worst = 0.0
-        for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
-            if top < 0.5:
-                continue
-            dx = abs(x - cx) - hx
-            dy = abs(y - cy) - hy
-            pen = margin - math.hypot(max(0.0, dx), max(0.0, dy))
-            if pen > worst:
-                worst = pen
-        return worst
+        """키 큰 구역(벽/닫힌 문/장롱 — 윗면 0.5m 이상)만의 관통량.
+
+        numpy 벡터화 — 스캔 월드는 구역이 수백 개라 매 틱 파이썬 루프가
+        병목이 됨 (의미는 종전과 동일)."""
+        a = self._zone_arr
+        m = self._zone_tall_mask
+        if not m.any():
+            return 0.0
+        a = a[m]
+        dx = np.maximum(0.0, np.abs(x - a[:, 0]) - a[:, 2])
+        dy = np.maximum(0.0, np.abs(y - a[:, 1]) - a[:, 3])
+        pen = a[:, 4] - np.hypot(dx, dy)
+        return max(0.0, float(pen.max()))
 
     def _zone_pen(self, x, y):
         """(x,y)에서 가구 차단 구역 관통량(최댓값). 0이면 자유 공간."""
-        worst = 0.0
-        for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
-            dx = abs(x - cx) - hx
-            dy = abs(y - cy) - hy
-            d = math.hypot(max(0.0, dx), max(0.0, dy))
-            pen = margin - d
-            if pen > worst:
-                worst = pen
-                self._zone_hit_name = name
-        return worst
+        a = self._zone_arr
+        if len(a) == 0:
+            return 0.0
+        dx = np.maximum(0.0, np.abs(x - a[:, 0]) - a[:, 2])
+        dy = np.maximum(0.0, np.abs(y - a[:, 1]) - a[:, 3])
+        pen = a[:, 4] - np.hypot(dx, dy)
+        i = int(np.argmax(pen))
+        worst = float(pen[i])
+        if worst > 0.0:
+            self._zone_hit_name = self._zone_arr_names[i]
+            return worst
+        return 0.0
 
     def apply_locomotion(self):
         """키네마틱 베이스 이동 (보행 컨트롤러 대체).
@@ -1281,10 +1391,12 @@ class X2SimNode(Node):
         self.pub_cam_info.publish(self.cam_info)
 
     def _warm_worlds(self):
-        """모든 월드 예열: 모델 컴파일(락 밖, CPU) + 렌더러 생성(GL 직렬화).
+        """모든 월드의 모델 컴파일 예열 (락 밖, CPU).
 
-        전환 지연의 두 지연원을 부팅 직후 백그라운드로 선지불한다.
-        렌더 품질/주기는 건드리지 않음 — 캐시일 뿐."""
+        ★렌더러는 예열하지 않는다 — 렌더러 페어는 월드당 ~0.6-0.9GB
+        (OSMesa/llvmpipe 컨텍스트)로, 전 월드 예열이 스캔 월드 추가 후
+        컨테이너 메모리를 넘겨 OOM 크래시 루프를 만들었다 (exit 247).
+        전환 시 렌더러 생성 ~0.3s만 지불 (모델 컴파일 ~2-6.5s는 캐시)."""
         model_path = self.get_parameter('model_path').value
         time.sleep(3.0)                     # 부팅 안정화 후 시작
         for name in list(WORLDS):
@@ -1295,15 +1407,7 @@ class X2SimNode(Node):
                     compiled = load_model_with_camera_and_props(
                         model_path, name)
                     self._world_cache[name] = compiled
-                if name not in self._renderer_cache:
-                    m = self._world_cache[name][0]
-                    with self.render_lock, self.prev_lock:
-                        self._renderer_cache[name] = (
-                            mujoco.Renderer(m, height=self.cam_size[1],
-                                            width=self.cam_size[0]),
-                            mujoco.Renderer(m, height=self.prev_size[1],
-                                            width=self.prev_size[0]))
-                    self.get_logger().info(f'월드 예열 완료: {name}')
+                    self.get_logger().info(f'월드 컴파일 예열: {name}')
             except Exception as e:
                 self.get_logger().warning(f'월드 예열 실패({name}): {e}')
 

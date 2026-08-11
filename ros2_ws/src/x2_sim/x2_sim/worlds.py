@@ -544,4 +544,61 @@ WORLDS['newoffice'] = {
     ],
 }
 
+# ---------------------------------------------------------------------------
+# 스캔 월드 — 실제 사진측량(photogrammetry) 3D 스캔 공간.
+# tools/convert_scan.py 가 GLB → OBJ+텍스처+meta.json(점유구역/스폰/자유
+# 지점)으로 변환한 산출물을 소비한다. 씬별 하드코딩 없음: 어떤 스캔이든
+# 같은 파이프라인. meta.json이 없으면(변환 전) 월드 자체가 등록되지 않아
+# 다른 월드에 영향 없음.
+# 실기 전환: 스캔 메시=시각 전용(sim_only), 점유구역=SLAM 코스트맵 대응물
+# — 에이전트 계약 무변경. VLM look 입력이 실사진이라 전환 충실도 ↑.
+import json as _json
+import os as _os
+
+
+def _scan_world(desc, sdir, obj_specs):
+    """스캔 월드 정의 — meta.json의 자유 지점에 동적 물체 자동 배치."""
+    meta_p = _os.path.join(sdir, 'meta.json')
+    if not _os.path.exists(meta_p):
+        return None
+    with open(meta_p) as fp:
+        meta = _json.load(fp)
+    free = meta.get('free', [])
+    props = []
+    for i, (name, gtype, size, rgba) in enumerate(obj_specs):
+        if i >= len(free):
+            break
+        x, y = free[i]
+        h = size[0] if gtype == 'sphere' else size[-2 if gtype == 'cylinder'
+                                                   else -1]
+        props.append((name, gtype, size, [x, y, h + 0.03], rgba,
+                      {'grasp': True}))
+    return {
+        'desc': desc,
+        'scan': {'dir': sdir},
+        'explore': True,
+        'props': props,
+        # 사진측량 텍스처는 조명이 구워져 있어(emission 0.35) 약한 보조광만
+        'lights': [
+            ([0.0, 0.0, 2.3], [0.0, 0.0, -1.0], [0.45, 0.45, 0.45]),
+        ],
+    }
+
+
+_apt = _scan_world(
+    '스캔 아파트 (실사진 3D — 탐색·학습)', '/ws/assets/scans/apartment', [
+        ('teddy', 'box', [0.09, 0.07, 0.11], [0.62, 0.45, 0.30, 1.0]),
+        ('ball', 'sphere', [0.09, 0, 0], [0.85, 0.20, 0.15, 1.0]),
+        ('cup', 'cylinder', [0.04, 0.06, 0], [0.95, 0.95, 0.90, 1.0]),
+    ])
+if _apt:
+    WORLDS['apartment'] = _apt
+
+_vg = _scan_world(
+    '반 고흐의 방 (스캔 3D)', '/ws/assets/scans/vangogh', [
+        ('ball', 'sphere', [0.09, 0, 0], [0.85, 0.20, 0.15, 1.0]),
+    ])
+if _vg:
+    WORLDS['vangogh'] = _vg
+
 DEFAULT_WORLD = 'home'
