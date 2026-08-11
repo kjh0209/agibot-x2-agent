@@ -368,6 +368,125 @@ def free_space(occ, floor, xy_min, cell, erode_m=0.35):
         [c.round(3).tolist() for c in chosen[1:]]
 
 
+def interior_mask(occ, floor, xy_min, cell, spawn, dilate_m=1.2):
+    """실내 마스크 — 스폰에서 바닥 연결된 보행 영역 + 팽창.
+
+    사진측량 스캔엔 창/개구부 너머의 실외 지형(언덕·마당 등)이 함께
+    잡혀 있어 그대로 두면 '집 밖 월드'가 보인다 (실측: 아파트 스캔의
+    언덕). 실내의 물리적 정의 = 로봇이 걸어서 닿을 수 있는 바닥과
+    그것을 둘러싼 구조(팽창 반경 내 벽/천장). 그 밖은 잘라낸다."""
+    free = floor & ~occ
+    nx, ny = occ.shape
+    si = int((spawn[0] - xy_min[0]) / cell)
+    sj = int((spawn[1] - xy_min[1]) / cell)
+    mask = np.zeros_like(free)
+    stack = [(si, sj)]
+    mask[si, sj] = True
+    while stack:
+        i, j = stack.pop()
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            a, b = i + di, j + dj
+            if 0 <= a < nx and 0 <= b < ny and free[a, b] \
+                    and not mask[a, b]:
+                mask[a, b] = True
+                stack.append((a, b))
+    if dilate_m <= 0:
+        return mask
+    r = max(1, int(round(dilate_m / cell)))
+    # 팽창 (누적합 창 검사)
+    ip = np.pad(mask.astype(np.int32), r + 1)
+    cs = ip.cumsum(0).cumsum(1)
+    out = np.zeros_like(mask)
+    for i in range(nx):
+        for j in range(ny):
+            a, b = i + 1, j + 1
+            s = cs[a + 2 * r + 1, b + 2 * r + 1] - cs[a, b + 2 * r + 1] \
+                - cs[a + 2 * r + 1, b] + cs[a, b]
+            out[i, j] = s > 0
+    return out
+
+
+def plug_holes(inmask, occ, xy_min, cell):
+    """실내 경계의 미촬영 구멍 탐지 → 막을 벽 박스 목록.
+
+    보행 가능 실내(inmask)에 인접한 셀이 '벽(occ)도 실내도 아닌' 경우
+    = 스캔 구멍. 그대로 두면 재구성물의 바깥 껍데기(울퉁불퉁한 외피)
+    가 '집 밖 언덕'처럼 보이고 로봇이 밖으로 샐 수도 있다 (실측).
+    문간·복도는 양쪽 다 실내라 여기 걸리지 않는다 — 범용 규칙."""
+    nx, ny = occ.shape
+    rim = np.zeros_like(occ)
+    for i in range(nx):
+        for j in range(ny):
+            if not inmask[i, j]:
+                continue
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                a, b = i + di, j + dj
+                if 0 <= a < nx and 0 <= b < ny and not inmask[a, b] \
+                        and not occ[a, b]:
+                    rim[a, b] = True
+    boxes = []
+    for j in range(ny):
+        i = 0
+        while i < nx:
+            if not rim[i, j]:
+                i += 1
+                continue
+            k = i
+            while k + 1 < nx and rim[k + 1, j]:
+                k += 1
+            boxes.append([round(xy_min[0] + (i + k + 1) / 2 * cell, 3),
+                          round(xy_min[1] + (j + 0.5) * cell, 3),
+                          round((k - i + 1) / 2 * cell, 3),
+                          round(cell / 2, 3)])
+            i = k + 1
+    # 세로 병합
+    merged = []
+    boxes.sort(key=lambda b: (b[0], b[2], b[1]))
+    for b in boxes:
+        if merged and merged[-1][0] == b[0] and merged[-1][2] == b[2] \
+                and abs((merged[-1][1] + merged[-1][3]) -
+                        (b[1] - b[3])) < 1e-6:
+            m = merged[-1]
+            lo, hi = m[1] - m[3], b[1] + b[3]
+            m[1] = round((lo + hi) / 2, 3)
+            m[3] = round((hi - lo) / 2, 3)
+        else:
+            merged.append(list(b))
+    return merged
+
+
+def filter_parts_to_mask(parts, mask, xy_min, cell):
+    """마스크 밖 삼각형 제거 + 정점 재색인. 빈 파트는 탈락."""
+    kept = []
+    removed = 0
+    for name, g in parts:
+        cen = g.triangles_center
+        ii = ((cen[:, 0] - xy_min[0]) / cell).astype(int)
+        jj = ((cen[:, 1] - xy_min[1]) / cell).astype(int)
+        nx, ny = mask.shape
+        ok = (ii >= 0) & (ii < nx) & (jj >= 0) & (jj < ny)
+        inside = np.zeros(len(cen), bool)
+        inside[ok] = mask[ii[ok], jj[ok]]
+        removed += int((~inside).sum())
+        if not inside.any():
+            continue
+        f = np.asarray(g.faces)[inside]
+        used, inv = np.unique(f, return_inverse=True)
+        g2 = trimesh.Trimesh(
+            vertices=np.asarray(g.vertices)[used],
+            faces=inv.reshape(-1, 3), process=False)
+        if getattr(g.visual, 'uv', None) is not None:
+            g2.visual = trimesh.visual.TextureVisuals(
+                uv=np.asarray(g.visual.uv)[used],
+                material=g.visual.material)
+        else:
+            g2.visual = g.visual
+        kept.append((name, g2))
+    print(f'실내 마스킹: 삼각형 {removed}개 제거(실외), '
+          f'파트 {len(parts)}→{len(kept)}')
+    return kept
+
+
 def main():
     glb, outdir = sys.argv[1], sys.argv[2]
     budget = int(sys.argv[3]) if len(sys.argv) > 3 else 150000
@@ -392,6 +511,16 @@ def main():
     T[:3, 3] = [-cxy[0], -cxy[1], -z0]
     for _, g in parts:
         g.apply_transform(T)
+
+    # ---- 실내 마스킹: 1차 점유 분석으로 실내를 정의하고 실외 절단 ----
+    occ0, top0, floor0, seat0, xym0 = build_occupancy(parts, cell)
+    spawn0, _ = free_space(occ0, floor0, xym0, cell)
+    mask = interior_mask(occ0, floor0, xym0, cell, spawn0)
+    parts = filter_parts_to_mask(parts, mask, xym0, cell)
+    # 실내 경계 구멍 → 막을 벽 박스 (BFS 원시 마스크 기준)
+    inmask0 = interior_mask(occ0, floor0, xym0, cell, spawn0, dilate_m=0.0)
+    plugs = plug_holes(inmask0, occ0, xym0, cell)
+    print(f'구멍 마개 벽: {len(plugs)}개')
 
     total = sum(len(g.faces) for _, g in parts)
     print(f'up_axis={up} floor_z={z0:.3f} tris={total}')
@@ -431,7 +560,7 @@ def main():
     bbox = [allv[:, 0].min(), allv[:, 1].min(),
             allv[:, 0].max(), allv[:, 1].max()]
     meta = {'parts': meta_parts, 'zones': zones, 'seats': seats,
-            'spawn': spawn, 'free': free, 'cell': cell,
+            'plugs': plugs, 'spawn': spawn, 'free': free, 'cell': cell,
             'bbox': [round(float(b), 3) for b in bbox]}
     with open(os.path.join(outdir, 'meta.json'), 'w') as fp:
         json.dump(meta, fp)

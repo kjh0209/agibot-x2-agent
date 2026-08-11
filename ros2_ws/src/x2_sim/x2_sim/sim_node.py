@@ -215,7 +215,7 @@ def load_model_with_camera_and_props(model_path: str,
                 # 사진측량 텍스처엔 촬영 당시 조명이 구워져 있음 — 자체
                 # 발광으로 렌더 조명 의존을 줄이고, 반사광은 꺼서
                 # (스펙큘러 하이라이트가 '젖은 바닥'처럼 보임) 사진 톤 유지
-                mat.emission = float(scan.get('emission', 0.35))
+                mat.emission = float(scan.get('emission', 0.45))
                 mat.specular = 0.05
                 mat.shininess = 0.05
                 mat.reflectance = 0.0
@@ -230,6 +230,19 @@ def load_model_with_camera_and_props(model_path: str,
                 g.material = matname
             if part.get('rgba'):
                 g.rgba = part['rgba']
+        # 미촬영 구멍 마개 벽 — 어두운 무광 박스 (시각 전용; 이동
+        # 차단은 _build_world에서 구역으로 합류). 구멍 너머 재구성물
+        # 바깥 껍데기가 '집 밖 언덕'처럼 보이던 것 차단.
+        for pi, (pcx, pcy, phx, phy) in enumerate(
+                smeta.get('plugs', [])):
+            pg = wb.add_geom()
+            pg.name = f'scan_plug_{pi}'
+            pg.type = GEOM_TYPES['box']
+            pg.size = [phx + 0.02, phy + 0.02, 1.15]
+            pg.pos = [pcx, pcy, 1.15]
+            pg.rgba = [0.045, 0.045, 0.05, 1.0]
+            pg.contype = 0
+            pg.conaffinity = 0
         bx0, by0, bx1, by1 = smeta['bbox']
         fl = wb.add_geom()
         fl.name = 'scan_phys_floor'    # static_names 미등록 → 구역 제외
@@ -237,23 +250,46 @@ def load_model_with_camera_and_props(model_path: str,
         fl.size = [(bx1 - bx0) / 2 + 0.5, (by1 - by0) / 2 + 0.5, 0.05]
         fl.pos = [(bx0 + bx1) / 2, (by0 + by1) / 2, -0.05]
         fl.rgba = [1.0, 1.0, 1.0, 0.0]
-        # 어두운 무광 배경 — 기본 하늘 그라데이션(파란 허공)이 스캔
-        # 구멍 너머로 보이면 데모 품질을 해침. '조명 없는 바깥'처럼
-        # 읽히는 어두운 회색 단색으로.
-        sky = spec.add_texture()
-        sky.name = 'scan_sky'
-        sky.type = mujoco.mjtTexture.mjTEXTURE_SKYBOX
-        sky.builtin = mujoco.mjtBuiltin.mjBUILTIN_FLAT
-        sky.rgb1 = [0.055, 0.055, 0.065]
-        sky.rgb2 = [0.055, 0.055, 0.065]
-        sky.width = 32
-        sky.height = 32
+        # 벤더 MJCF의 기본 무한 바닥 평면을 시각적으로 숨김 — 스캔
+        # 구멍 너머로 이 평면이 지평선까지 보여 '집 밖의 어두운 언덕
+        # /바다'처럼 보이던 실측 사고 (레이캐스트로 특정). 물리
+        # (contype)는 유지 — 투명 렌더만.
+        for g in spec.worldbody.geoms:
+            if (g.name or '') == 'floor':
+                g.rgba = [g.rgba[0], g.rgba[1], g.rgba[2], 0.0]
+        # 어두운 무광 배경 — 스캔 구멍 너머로 벤더 모델의 파란
+        # 그라데이션 하늘이 보이면 '집 밖 세계'처럼 읽힘 (실측:
+        # 옆 공간 어두운 바닥 + 파란 하늘 = "언덕과 바다" 오인).
+        # ★벤더 MJCF에 스카이박스가 이미 있어 새로 추가하면 무시됨
+        # — 기존 것을 근흑색 단색으로 수정.
+        _has_sky = False
+        for t in spec.textures:
+            if t.type == mujoco.mjtTexture.mjTEXTURE_SKYBOX:
+                t.builtin = mujoco.mjtBuiltin.mjBUILTIN_FLAT
+                t.rgb1 = [0.03, 0.03, 0.035]
+                t.rgb2 = [0.03, 0.03, 0.035]
+                _has_sky = True
+        if not _has_sky:
+            sky = spec.add_texture()
+            sky.name = 'scan_sky'
+            sky.type = mujoco.mjtTexture.mjTEXTURE_SKYBOX
+            sky.builtin = mujoco.mjtBuiltin.mjBUILTIN_FLAT
+            sky.rgb1 = [0.03, 0.03, 0.035]
+            sky.rgb2 = [0.03, 0.03, 0.035]
+            sky.width = 32
+            sky.height = 32
 
     model = spec.compile()
     # CPU(OSMesa) 렌더 최적화 — 실측: 그림자맵 4096 + MSAA 4x가 프레임당
     # ~1.2s를 차지 (해상도 무관 고정비용). 끄면 640x480 기준 1.9s→0.5s.
     model.vis.quality.shadowsize = 256
     model.vis.quality.offsamples = 0
+    if scan:
+        # 로봇 헤드라이트 강화 — 사진측량 텍스처의 그늘진 구역(원본
+        # 촬영이 어두웠던 곳)이 '검은 허공/지형'처럼 보이던 것 완화.
+        # 실기 카메라의 노출 보정 역할의 시각 보정 (sim_only).
+        model.vis.headlight.diffuse[:] = 0.75
+        model.vis.headlight.ambient[:] = 0.35
     for i in range(model.nlight):
         model.light_castshadow[i] = 0
     return model, static_names, grasp_names
@@ -510,6 +546,10 @@ class X2SimNode(Node):
                 [cx, by0 - t, hx_full, t, 2.0],
                 [cx, by1 + t, hx_full, t, 2.0],
             ]
+            # 구멍 마개 벽도 차단 구역으로 (로봇이 구멍으로 새는 것
+            # 방지 — 시각과 이동이 일치)
+            for (pcx, pcy, phx, phy) in smeta.get('plugs', []):
+                self._scan_zones.append([pcx, pcy, phx, phy, 2.2])
         else:
             self._scan_seats = []
 
