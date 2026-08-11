@@ -95,6 +95,27 @@ def load_model_with_camera_and_props(model_path: str,
     cam.quat = quat
     cam.fovy = 55.0
 
+    # ---------- 실사 텍스처 (시각 계층 전용 — 실기 전환 무영향) ----------
+    # world['textures'] = {mat이름: {'file': png경로, 'repeat': (rx,ry)}}
+    # world['mat_rules'] = [(이름 부분문자열, mat이름), ...] — 정적 소품에
+    # 첫 매칭 규칙 적용. CC0 실사 재질로 VLM look/탐색 입력의 현실성을
+    # 높인다 (실기 카메라 입력과 유사해져 전환 충실도 ↑).
+    for mname, tdef in (world.get('textures') or {}).items():
+        tx = spec.add_texture()
+        tx.name = 't_' + mname
+        tx.type = mujoco.mjtTexture.mjTEXTURE_2D
+        tx.file = tdef['file']
+        mat = spec.add_material()
+        mat.name = mname
+        mat.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = 't_' + mname
+        mat.texrepeat = list(tdef.get('repeat', (2, 2)))
+
+    def _mat_for(name):
+        for pat, mname in (world.get('mat_rules') or []):
+            if pat in name:
+                return mname
+        return None
+
     wb = spec.worldbody
     for pos, direction, diffuse in world['lights']:
         light = wb.add_light()
@@ -139,6 +160,14 @@ def load_model_with_camera_and_props(model_path: str,
                 # 시각 전용(문짝/문틀 상단 등) — 충돌·이동 차단 없음
                 g.contype = 0
                 g.conaffinity = 0
+            m = opts.get('mat') or _mat_for(name)
+            if m:
+                g.material = m
+                # 원래 색을 틴트로 유지 (rgba×텍스처) — 질감과 고유색
+                # ('초록 안락의자' 등 VLM 식별 단서) 양립. 다만 어두운
+                # 원색은 텍스처를 죽이므로 1.6배 밝힘(상한 1)
+                g.rgba = [min(1.0, rgba[0] * 1.6), min(1.0, rgba[1] * 1.6),
+                          min(1.0, rgba[2] * 1.6), rgba[3]]
             static_names.append(name)
 
     # 기능형 문 — 닫힘 포즈(통로 가로막음)로 생성. 런타임에 열면
@@ -150,6 +179,9 @@ def load_model_with_camera_and_props(model_path: str,
         g.size = list(d['size'])
         g.pos = [d['closed_pos'][0], d['closed_pos'][1], d['size'][2]]
         g.rgba = [0.52, 0.38, 0.25, 1.0]
+        if 'wood' in (world.get('textures') or {}):
+            g.material = 'wood'
+            g.rgba = [1.0, 1.0, 1.0, 1.0]
         static_names.append(d['name'])
 
     model = spec.compile()

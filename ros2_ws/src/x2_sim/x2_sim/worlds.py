@@ -143,6 +143,32 @@ WORLDS = {
 
 WORLDS['home'] = {
     'desc': '집 (거실+주방+스튜디오+사무실 통합 공간 — 전부 걸어서 이동)',
+    # 실사 텍스처 (CC0, /ws/assets/tex) — 시각 전용, 실기 전환 무영향
+    'textures': {
+        'wood_floor': {'file': '/ws/assets/tex/WoodFloor051.png',
+                       'repeat': (6, 6)},
+        'plaster': {'file': '/ws/assets/tex/Plaster001.png',
+                    'repeat': (3, 2)},
+        'fabric': {'file': '/ws/assets/tex/Fabric030.png',
+                   'repeat': (2, 2)},
+        'wood': {'file': '/ws/assets/tex/Wood067.png', 'repeat': (2, 2)},
+        'tiles': {'file': '/ws/assets/tex/Tiles101.png', 'repeat': (3, 3)},
+        'carpet': {'file': '/ws/assets/tex/Carpet004.png',
+                   'repeat': (2, 2)},
+    },
+    'mat_rules': [
+        ('_floor', 'wood_floor'), ('rug', 'carpet'),
+        ('_ceiling', 'plaster'), ('wall', 'plaster'), ('divider', 'plaster'),
+        ('div_', 'plaster'), ('seg', 'plaster'), ('part', 'plaster'),
+        ('lintel', 'wood'), ('backdrop', 'plaster'),
+        ('mattress', 'fabric'), ('pillow', 'fabric'), ('sofa', 'fabric'),
+        ('armchair', 'fabric'), ('chair', 'fabric'),
+        ('counter', 'tiles'), ('island', 'wood'), ('stove', 'tiles'),
+        ('bed_frame', 'wood'), ('wardrobe', 'wood'), ('bookshelf', 'wood'),
+        ('shelf', 'wood'), ('desk', 'wood'), ('table', 'wood'),
+        ('cabinet', 'wood'), ('stand', 'wood'),
+    ],
+
     # 기능형 문 — closed: 통로를 가로막음(충돌+이동 차단),
     # open: 문설주 쪽으로 접힘(시각만). open_door/close_door로 조작.
     'door_defs': [
@@ -311,6 +337,32 @@ WORLDS['home'] = {
 #       동쪽 침실(침대·옷장). 시작점 (0,0) = 라운지 남측.
 WORLDS['newhouse'] = {
     'desc': '새 집 (미지 공간 — 탐색·학습 모드)',
+    # 실사 텍스처 (CC0, /ws/assets/tex) — 시각 전용, 실기 전환 무영향
+    'textures': {
+        'wood_floor': {'file': '/ws/assets/tex/WoodFloor051.png',
+                       'repeat': (6, 6)},
+        'plaster': {'file': '/ws/assets/tex/Plaster001.png',
+                    'repeat': (3, 2)},
+        'fabric': {'file': '/ws/assets/tex/Fabric030.png',
+                   'repeat': (2, 2)},
+        'wood': {'file': '/ws/assets/tex/Wood067.png', 'repeat': (2, 2)},
+        'tiles': {'file': '/ws/assets/tex/Tiles101.png', 'repeat': (3, 3)},
+        'carpet': {'file': '/ws/assets/tex/Carpet004.png',
+                   'repeat': (2, 2)},
+    },
+    'mat_rules': [
+        ('_floor', 'wood_floor'), ('rug', 'carpet'),
+        ('_ceiling', 'plaster'), ('wall', 'plaster'), ('divider', 'plaster'),
+        ('div_', 'plaster'), ('seg', 'plaster'), ('part', 'plaster'),
+        ('lintel', 'wood'), ('backdrop', 'plaster'),
+        ('mattress', 'fabric'), ('pillow', 'fabric'), ('sofa', 'fabric'),
+        ('armchair', 'fabric'), ('chair', 'fabric'),
+        ('counter', 'tiles'), ('island', 'wood'), ('stove', 'tiles'),
+        ('bed_frame', 'wood'), ('wardrobe', 'wood'), ('bookshelf', 'wood'),
+        ('shelf', 'wood'), ('desk', 'wood'), ('table', 'wood'),
+        ('cabinet', 'wood'), ('stand', 'wood'),
+    ],
+
     'door_defs': [
         {'name': 'nh_door_w', 'closed_pos': (-1.2, 0.0),
          'size': (0.03, 0.63, 0.90), 'open_pos': (-0.57, -0.68),
@@ -401,6 +453,32 @@ WORLDS['newhouse'] = {
 # 전부 개방 어휘 VLM 인식의 결과여야 함.
 WORLDS['newoffice'] = {
     'desc': '새 사무실 (미지 공간 2 — 탐색 일반화 검증)',
+    # 실사 텍스처 (CC0, /ws/assets/tex) — 시각 전용, 실기 전환 무영향
+    'textures': {
+        'wood_floor': {'file': '/ws/assets/tex/WoodFloor051.png',
+                       'repeat': (6, 6)},
+        'plaster': {'file': '/ws/assets/tex/Plaster001.png',
+                    'repeat': (3, 2)},
+        'fabric': {'file': '/ws/assets/tex/Fabric030.png',
+                   'repeat': (2, 2)},
+        'wood': {'file': '/ws/assets/tex/Wood067.png', 'repeat': (2, 2)},
+        'tiles': {'file': '/ws/assets/tex/Tiles101.png', 'repeat': (3, 3)},
+        'carpet': {'file': '/ws/assets/tex/Carpet004.png',
+                   'repeat': (2, 2)},
+    },
+    'mat_rules': [
+        ('_floor', 'wood_floor'), ('rug', 'carpet'),
+        ('_ceiling', 'plaster'), ('wall', 'plaster'), ('divider', 'plaster'),
+        ('div_', 'plaster'), ('seg', 'plaster'), ('part', 'plaster'),
+        ('lintel', 'wood'), ('backdrop', 'plaster'),
+        ('mattress', 'fabric'), ('pillow', 'fabric'), ('sofa', 'fabric'),
+        ('armchair', 'fabric'), ('chair', 'fabric'),
+        ('counter', 'tiles'), ('island', 'wood'), ('stove', 'tiles'),
+        ('bed_frame', 'wood'), ('wardrobe', 'wood'), ('bookshelf', 'wood'),
+        ('shelf', 'wood'), ('desk', 'wood'), ('table', 'wood'),
+        ('cabinet', 'wood'), ('stand', 'wood'),
+    ],
+
     'door_defs': [
         {'name': 'no_door', 'closed_pos': (-1.6, 0.0),
          'size': (0.03, 0.58, 0.90), 'open_pos': (-1.02, -0.62),
