@@ -930,6 +930,17 @@ class X2SimNode(Node):
             if found is None:
                 found = self._find_platform(
                     -1, (0.25, 0.4, 0.55, 0.7, 0.85))
+            # ★표면 깊이 검증 — 진입점 0.45m 안쪽에도 표면이 있어야
+            # 몸을 실을 수 있는 가구다. 폭 15cm 창턱을 '침대'로 알고
+            # 올라가 벽에 머리를 박고 눕던 실측 사고 방지.
+            if found:
+                gx, gy, top = found
+                n = math.hypot(gx, gy) or 1.0
+                deep = self._platform_top(
+                    self.base_xyz[0] + gx + gx / n * 0.45,
+                    self.base_xyz[1] + gy + gy / n * 0.45)
+                if deep <= 0.05:
+                    found = None
             if found:
                 gx, gy, top = found     # 감지 지점보다 0.30m 안쪽까지
                 n = math.hypot(gx, gy) or 1.0
@@ -937,6 +948,19 @@ class X2SimNode(Node):
                 self._pose_surface = top
             else:
                 glide, top = (0.45 * c, 0.45 * s), 0.0
+            # ★머리 공간 검증 — 누우면 머리가 베이스에서 글라이드
+            # 방향으로 ~0.75m 더 뻗는다. 그 지점이 벽/키 큰 구조물이면
+            # 눕기 자체를 거부 (실기였다면 벽지/로봇 머리가 파손될
+            # 상황 — 사용자 지적). 자세는 그대로, 에이전트가 posture
+            # 미변경을 보고 정직하게 실패 보고.
+            gn = math.hypot(glide[0], glide[1]) or 1.0
+            head_x = self.base_xyz[0] + glide[0] + glide[0] / gn * 0.75
+            head_y = self.base_xyz[1] + glide[1] + glide[1] / gn * 0.75
+            if self._tall_pen(head_x, head_y) > 0.0:
+                self.get_logger().info(
+                    '눕기 거부: 머리가 뻗을 방향에 벽/키 큰 구조물 — '
+                    '공간 부족')
+                return
             # +0.22: 몸이 매트리스에 파묻히면 접촉 지터로 천장 시야가
             # 계속 흔들림 (사용자 제보) — 접촉을 최소화하는 높이.
             # 피치 -1.72(-98°): 카메라 자체가 18° 하향 장착이라 -80°로는

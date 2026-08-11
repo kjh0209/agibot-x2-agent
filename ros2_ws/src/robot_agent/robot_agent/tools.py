@@ -2002,6 +2002,14 @@ class ToolExecutor:
             self._approach_nearest_seat()   # 침대/소파가 근처면 옆까지
         self.pub_posture.publish(String(data='lie'))
         time.sleep(2.0)                 # 글라이드+눕기 램프 완료 대기
+        if getattr(self.node, 'sim_posture', 'stand') != 'lie':
+            # 시뮬이 눕기를 거부 — 머리가 뻗을 방향에 벽/구조물
+            msg = ('누울 공간이 없어 눕기 거부됨 — 머리가 뻗을 방향에 '
+                   '벽/키 큰 구조물. 방향을 돌리거나(turn) 더 넓은 '
+                   '자리로 이동 후 재시도. 눕지 않았으니 누웠다고 '
+                   '말하지 말 것')
+            self.audit('lie_down', {}, False, msg)
+            return {'error': msg}
         sh = (getattr(self.node, 'posture_info', {}) or {}).get(
             'surface_h', 0.0)
         surface = (f'높이 {sh:.2f}m 가구 위에 누움' if sh > 0.05
