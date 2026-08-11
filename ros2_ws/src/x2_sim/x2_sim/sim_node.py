@@ -32,6 +32,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from aimdk_msgs.msg import (
+    JointCommandArray,
     JointState,
     JointStateArray,
     McLocomotionVelocity,
@@ -346,6 +347,12 @@ class X2SimNode(Node):
         self.create_subscription(
             McLocomotionVelocity, '/aima/mc/locomotion/velocity',
             self.on_cmd_vel, 10)
+        # 고개(머리 관절) 위치 명령 — 실기 HAL 프로토콜 그대로
+        # (JointCommandArray, name 기반). 카메라가 head_pitch_link에
+        # 있어 고개를 돌리면 시야가 팬/틸트된다.
+        self.create_subscription(
+            JointCommandArray, '/aima/hal/joint/head/command',
+            self.on_head_cmd, 10)
 
         # MC 목 서비스 (실기 프로토콜 강제: 모드/소스 게이트)
         self.mc = McMock(self)
@@ -488,8 +495,6 @@ class X2SimNode(Node):
             # 실행)의 표면 정보라 정답 기하 사용이 정당 — 게이팅과
             # 동일 원칙.
             self._scan_seats = smeta.get('seats', [])
-        else:
-            self._scan_seats = []
             # ★경계 봉쇄 — 실제 스캔엔 구멍(미촬영 창/개구부)이 있어
             # 로봇이 스캔 밖 허공으로 걸어나가는 사고 실측 (탐색이
             # 허공에서 '사무실'을 학습). bbox 4변을 키 큰 구역으로
@@ -505,6 +510,8 @@ class X2SimNode(Node):
                 [cx, by0 - t, hx_full, t, 2.0],
                 [cx, by1 + t, hx_full, t, 2.0],
             ]
+        else:
+            self._scan_seats = []
 
         # 집기 시스템: 손(오른 손목 끝 링크) + 물체별 freejoint 주소
         self.hand_bid = mujoco.mj_name2id(
@@ -1031,6 +1038,20 @@ class X2SimNode(Node):
         res.success = True
         res.message = '시뮬 초기화 완료'
         return res
+
+    def on_head_cmd(self, msg: JointCommandArray):
+        """고개 관절 위치 명령 (실기 HAL 프로토콜) — q_ref 갱신.
+
+        관절 한계로 클램프 후 PD 홀드(_head_gain 상시 강성)가 유지.
+        자세 프레임워크와 독립 — 어떤 자세에서든 고개만 팬/틸트."""
+        with self.state_lock:
+            for jc in msg.joints:
+                ai = self.jname_to_ai.get(jc.name)
+                if ai is None or 'head' not in (jc.name or ''):
+                    continue
+                jid = self.act_joint_ids[ai]
+                lo, hi = self.model.jnt_range[jid]
+                self.q_ref[ai] = float(np.clip(jc.position, lo, hi))
 
     def on_cmd_vel(self, msg: McLocomotionVelocity):
         # 실기 의미론 게이트: locomotion 모드 + 등록된 소스가 아니면 무시

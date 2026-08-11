@@ -36,6 +36,9 @@ FEATURES = {
     # 실기 착석의 물리 전제(갠트리 금지 등)는 Phase 6 안전 체크리스트.
     'sit_down':    {'kind': 'tool', 'tier': 'parity'},
     'stand_up':    {'kind': 'tool', 'tier': 'parity'},
+    # 고개 팬/틸트 — 실기 HAL JointCommandArray 프로토콜 그대로
+    # (실기 검증은 Phase 6 체크리스트: 헤드 조인트 HAL 제어 가부)
+    'turn_head':   {'kind': 'tool', 'tier': 'parity'},
     # 핸드 하드웨어 필요 — 견적 회신 전 기본값: 미탑재(정책 A-3 (a)).
     # 핸드 포함 확정 시 real_available=True로 바꾸고 HandCommand 구현.
     'pick_up':     {'kind': 'tool', 'tier': 'real_needs_work',
@@ -128,9 +131,16 @@ def body_facts(target: str = None) -> str:
         lines.append(
             '- 현재 구성에는 물체를 집는 핸드가 없다. 집기/놓기 요청은 솔직히\n'
             '  안 된다고 말한다.')
-    lines.append(
-        '- 고개 돌리기는 preset(POINT_HEAD/SHAKE_HEAD)에는 있지만 특정 각도로\n'
-        '  돌리는 기능은 아직 없다 — 대신 몸 전체를 turn(각도)으로 돌린다.')
+    if is_enabled('turn_head', target):
+        lines.append(
+            '- 고개는 turn_head(yaw_deg, pitch_deg)로 좌우 ±21°/상하 ±22°\n'
+            '  돌릴 수 있다 (몸은 그대로). 그 이상 보려면 몸 전체를\n'
+            '  turn(각도)으로 돌린다.')
+    else:
+        lines.append(
+            '- 고개 돌리기는 preset(POINT_HEAD/SHAKE_HEAD)에는 있지만 특정\n'
+            '  각도로 돌리는 기능은 없다 — 대신 몸 전체를 turn(각도)으로\n'
+            '  돌린다.')
     if is_enabled('go_to_place', target):
         lines.append(
             '- 기본 공간은 집(home)이며 거실/주방/현관/소파/냉장고/스튜디오/\n'

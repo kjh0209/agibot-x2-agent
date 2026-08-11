@@ -18,7 +18,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from aimdk_msgs.msg import McAction, McInputAction, McLocomotionVelocity
+from aimdk_msgs.msg import (JointCommand, JointCommandArray, McAction,
+                            McInputAction, McLocomotionVelocity)
 from std_msgs.msg import String
 from aimdk_msgs.srv import (
     GetMcAction,
@@ -82,6 +83,10 @@ class ToolExecutor:
         self._move_thread = None
         self.pub_vel = node.create_publisher(
             McLocomotionVelocity, '/aima/mc/locomotion/velocity', 10)
+        # 고개 팬/틸트 — 실기 HAL 프로토콜(JointCommandArray) 그대로
+        self.pub_head = node.create_publisher(
+            JointCommandArray, '/aima/hal/joint/head/command', 10)
+        self._head_state = {'yaw': 0.0, 'pitch': 0.0}
         self._stop_requested = False
         # 하드와이어 정지 수신 (UI 버튼 등 외부 독립 경로) — 기본 콜백
         # 그룹이라 채팅 처리 중에도 즉시 실행됨
@@ -1187,6 +1192,39 @@ class ToolExecutor:
                   f'({took:.0f}초). 1.05m 이내면 pick_up 가능')
         self.audit('go_to_object', args, True, result)
         return {'ok': result}
+
+    HEAD_YAW_LIM = 0.366        # rad (±21°) — X2 head_yaw_joint 한계
+    HEAD_PITCH_LIM = 0.3838     # rad (±22°) — head_pitch_joint 한계
+
+    def turn_head(self, yaw_deg: float = 0.0, pitch_deg: float = 0.0):
+        """고개 팬/틸트 — 몸은 그대로, 카메라 시야만 이동.
+
+        절대 각도 지정(0,0=정면 복귀). 실기 HAL 관절 명령과 동일
+        프로토콜이라 전환 무수정."""
+        args = {'yaw_deg': yaw_deg, 'pitch_deg': pitch_deg}
+        want_y = math.radians(float(yaw_deg))
+        want_p = math.radians(float(pitch_deg))
+        cy = max(-self.HEAD_YAW_LIM, min(self.HEAD_YAW_LIM, want_y))
+        cp = max(-self.HEAD_PITCH_LIM, min(self.HEAD_PITCH_LIM, want_p))
+        m = JointCommandArray()
+        # 피치 관절은 +가 아래(실측) — 툴 계약은 직관적인 +위로 통일
+        for name, pos in (('head_yaw_joint', cy),
+                          ('head_pitch_joint', -cp)):
+            jc = JointCommand()
+            jc.name = name
+            jc.position = float(pos)
+            m.joints.append(jc)
+        self.pub_head.publish(m)
+        time.sleep(0.7)             # PD 정착 대기
+        self._head_state = {'yaw': cy, 'pitch': cp}
+        note = ''
+        if abs(cy - want_y) > 1e-6 or abs(cp - want_p) > 1e-6:
+            note = (' — 기계 한계(±21°/±22°)로 잘렸음. 더 돌리려면 '
+                    '몸을 turn')
+        msg = (f'고개: 좌우 {math.degrees(cy):+.0f}°, 상하 '
+               f'{math.degrees(cp):+.0f}°{note}')
+        self.audit('turn_head', args, True, msg)
+        return {'ok': msg}
 
     def go_to_point(self, x: float, y: float):
         """지도 좌표로 경로계획(A*) 이동 — 실기 Nav2 goToPose 대응.

@@ -219,6 +219,20 @@ ALL_TOOLS = [
         },
     },
     {
+        'name': 'turn_head',
+        'description': ('고개만 돌린다(몸은 그대로) — 카메라 시야 팬/'
+                        '틸트. 절대 각도: yaw_deg 좌우(+왼쪽, ±21° 한계), '
+                        'pitch_deg 상하(+위, ±22° 한계), (0,0)=정면 복귀. '
+                        '살짝 옆/위아래를 보는 용도 — 그 이상은 몸을 '
+                        'turn. 돌린 뒤 look으로 확인. 이동 전에는 정면'
+                        '(0,0)으로 복귀할 것.'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'yaw_deg': {'type': 'number'},
+                           'pitch_deg': {'type': 'number'}},
+        },
+    },
+    {
         'name': 'go_to_point',
         'description': ('지도 좌표 (x, y)로 경로계획(A*) 이동 — 문간과 '
                         '가구를 알아서 우회한다. 좌표계는 get_status의 '
