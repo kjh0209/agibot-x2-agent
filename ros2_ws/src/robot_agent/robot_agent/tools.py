@@ -1169,6 +1169,55 @@ class ToolExecutor:
         self.audit('go_to_object', args, True, result)
         return {'ok': result}
 
+    def go_to_point(self, x: float, y: float):
+        """지도 좌표로 경로계획(A*) 이동 — 실기 Nav2 goToPose 대응.
+
+        배운 장소/등록 물체가 없는 지점(보이는 방 안, 통로 너머)으로
+        들어갈 때 LLM이 수동 move를 반복하다 문간 게이팅에 걸리던 것의
+        정공 해법. 코스트맵이 있으면 어디든 우회 포함 도달."""
+        args = {'x': x, 'y': y}
+        guard = self._battery_guard()
+        if guard:
+            return {'error': guard}
+        tx, ty = float(x), float(y)
+        pos = self.node.odom or (0.0, 0.0)
+        if self._cost_pen(tx, ty) > 0.0:
+            # 목표가 가구/벽 여유 안 — 가장 가까운 자유 지점으로 완화
+            best = None
+            for r in (0.2, 0.35, 0.5, 0.7):
+                for k in range(12):
+                    a = k * math.pi / 6
+                    p = (tx + r * math.cos(a), ty + r * math.sin(a))
+                    if self._cost_pen(*p) <= 0.0:
+                        d = math.hypot(p[0] - tx, p[1] - ty)
+                        if best is None or d < best[0]:
+                            best = (d, p)
+                if best:
+                    break
+            if best is None:
+                msg = (f'({tx:.2f},{ty:.2f}) 주변이 전부 막혀 있음 — '
+                       f'다른 좌표를 시도')
+                self.audit('go_to_point', args, False, msg)
+                return {'error': msg}
+            tx, ty = best[1]
+        wps = self._plan_path(pos, (tx, ty))
+        if wps is None:
+            msg = (f'({tx:.2f},{ty:.2f})까지 코스트맵상 경로가 없음 — '
+                   f'막혀 있거나 지도 밖')
+            self.audit('go_to_point', args, False, msg)
+            return {'error': msg}
+        t0 = time.monotonic()
+        ok, detail = self._navigate(wps, timeout=120.0)
+        if ok:
+            end = self.node.odom or (0.0, 0.0)
+            msg = (f'({tx:.2f},{ty:.2f}) 도착 '
+                   f'({time.monotonic() - t0:.0f}초, 현재 위치 '
+                   f'({end[0]:.2f},{end[1]:.2f})). look으로 확인 가능')
+            self.audit('go_to_point', args, True, msg)
+            return {'ok': msg}
+        self.audit('go_to_point', args, False, detail)
+        return {'error': f'이동 중 문제: {detail}'}
+
     def _go_to_learned(self, place, args):
         """탐색 모드: 배운 장소로, 가본 셀만 밟아 이동."""
         cur = self.node.current_world

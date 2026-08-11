@@ -59,7 +59,14 @@ hz=$(timeout 6 ros2 topic hz /x2_sim/preview/compressed 2>/dev/null | grep -o 'a
 if python3 -c "exit(0 if float('${hz:-0}') >= 5.0 else 1)"; then ok "프리뷰 ${hz}fps (≥5)"; else bad "프리뷰 ${hz:-0}fps (<5)"; fi
 
 echo "=== [4] 심부름 E2E (주방→사과 픽업, 최대 90s) ==="
-curl -s -m 10 -X POST http://localhost:8080/reset >/dev/null
+# ★심부름 시나리오는 지도가 있는 home 기준 — 탐색 월드(스캔 등)에선
+#   '주방을 모른다'가 정답이라 E2E가 성립하지 않음. 명시 전환 후 리셋.
+#   (종전 8080은 잘못된 포트라 리셋이 무동작 — 구버전 에이전트의
+#   월드 오인 덕에 우연히 통과하던 것을 실측으로 발견)
+curl -s -m 10 -X POST http://localhost:8000/world \
+  -H 'Content-Type: application/json' -d '{"name":"home"}' >/dev/null
+sleep 6
+curl -s -m 10 -X POST http://localhost:8000/reset >/dev/null
 sleep 2
 T0=$(now_iso)
 send_msg "주방 가서 사과 집어와"

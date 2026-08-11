@@ -53,8 +53,9 @@ SYSTEM_BASE = """\
 - ★완료 보고는 사실만: 거리·상태값으로 확인되지 않은 일을 했다고
   주장하지 않는다. 접근이 안 됐으면 "아직 못 갔어"라고 말한다.
 - ★같은 방향 move가 2번 연속 '실제 이동 0.00m'이면 가구에 막힌 것 —
-  절대 같은 방향으로 반복하지 말고 go_to_object(물체) 또는
-  go_to_place로 우회한다.
+  절대 같은 방향으로 반복하지 말고 go_to_object(물체)/go_to_place/
+  go_to_point(좌표)로 우회한다. 문간·좁은 통로를 지나 "저 방에
+  들어가"는 수동 move가 아니라 go_to_point(방 안쪽 좌표)가 정답이다.
 - ★"~가져와/집어와"는 최단 절차로: go_to_object(물체) → pick_up.
   go_to_object 결과에 남은 거리가 나오므로 중간 look/get_status
   왕복을 넣지 않는다 (왕복마다 5~10초씩 느려짐).
@@ -215,6 +216,22 @@ ALL_TOOLS = [
             'type': 'object',
             'properties': {'object_name': {'type': 'string'}},
             'required': ['object_name'],
+        },
+    },
+    {
+        'name': 'go_to_point',
+        'description': ('지도 좌표 (x, y)로 경로계획(A*) 이동 — 문간과 '
+                        '가구를 알아서 우회한다. 좌표계는 get_status의 '
+                        'position과 동일. 배운 장소/물체가 아닌 곳(보이는 '
+                        '방 안, 통로 너머 등)으로 들어갈 때, 또는 move가 '
+                        '막힐 때(실제 이동 0.00m) 사용. 목표 좌표는 현재 '
+                        'position+yaw로 추정한다 (예: 정면 2m = x+2cosθ, '
+                        'y+2sinθ).'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'x': {'type': 'number'},
+                           'y': {'type': 'number'}},
+            'required': ['x', 'y'],
         },
     },
     {

@@ -47,6 +47,9 @@ FEATURES = {
                     'real_available': False},
     'go_to_object': {'kind': 'tool', 'tier': 'real_needs_work',
                      'real_available': False},
+    # 좌표 내비게이션 — 실기는 Nav2 goToPose 대응 (Phase 6.5)
+    'go_to_point': {'kind': 'tool', 'tier': 'real_needs_work',
+                    'real_available': False},
     # 미지 공간 탐색·학습 — 실기는 SLAM 자율 탐색으로 재구현 (Phase 6.5+)
     'explore':        {'kind': 'tool', 'tier': 'real_needs_work',
                        'real_available': False},

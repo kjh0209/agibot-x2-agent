@@ -1166,11 +1166,12 @@ class X2SimNode(Node):
             self.block_zones.append(
                 (float(p[0]), float(p[1]), hx, hy, margin, top, name))
         # 스캔 월드 점유 구역 — 격자 셀이 이미 표면 범위를 덮으므로
-        # 여유는 가구 구역보다 작게 (통로 폭 보존: 문간 ~0.85m 기준
-        # 0.20+0.20 차감 후에도 A* 자유 셀이 남도록)
+        # 여유는 가구 구역보다 작게. 0.20은 문간(~0.8m)을 사실상 로봇
+        # 폭 하나로 좁혀 '보이는 방을 못 들어가는' 실측 사고 → 0.15
+        # (셀 자체가 표면을 반셀 이상 덮어 실효 이격은 더 큼)
         for k, (cx, cy, hx, hy, top) in enumerate(
                 getattr(self, '_scan_zones', []) or []):
-            margin = 0.20 if top >= 0.5 else 0.10
+            margin = 0.15 if top >= 0.5 else 0.10
             self.block_zones.append(
                 (cx, cy, hx, hy, margin, top, f'scan_{k}'))
         # 게이팅 벡터화 배열 — 스캔 월드는 구역이 수십~수백 개라

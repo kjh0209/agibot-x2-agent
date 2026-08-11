@@ -19,6 +19,7 @@
 에이전트 계약(코스트맵 JSON/툴/토픽)은 변하지 않는다.
 """
 import json
+import math
 import os
 import sys
 
@@ -190,12 +191,50 @@ def build_occupancy(parts, cell, slice_lo=0.12, slice_hi=1.60):
                 i1 = min(nx - 1, int((t[:, 0].max() - xy_min[0]) / cell))
                 j0 = max(0, int((t[:, 1].min() - xy_min[1]) / cell))
                 j1 = min(ny - 1, int((t[:, 1].max() - xy_min[1]) / cell))
-                grid[i0:i1 + 1, j0:j1 + 1] = True
                 if keep_top:
+                    # ★차단 격자는 정밀 래스터화 — AABB 전체 마킹은
+                    # 문간 옆 벽의 큰 삼각형이 문 개구부까지 차단해
+                    # '들어갈 수 있는 방을 못 들어가는' 실측 사고.
+                    # 셀 중심이 삼각형 2D 투영에서 0.4셀 이내일 때만.
                     zc = min(2.2, float(zmax[ti]))
-                    sub = top[i0:i1 + 1, j0:j1 + 1]
-                    np.maximum(sub, zc, out=sub)
+                    for ii in range(i0, i1 + 1):
+                        for jj in range(j0, j1 + 1):
+                            px = xy_min[0] + (ii + 0.5) * cell
+                            py = xy_min[1] + (jj + 0.5) * cell
+                            if _tri_dist2d(t, px, py) <= 0.4 * cell:
+                                grid[ii, jj] = True
+                                if top[ii, jj] < zc:
+                                    top[ii, jj] = zc
+                else:
+                    # 바닥(자유 공간 후보)은 과대 마킹이 무해 — AABB 유지
+                    grid[i0:i1 + 1, j0:j1 + 1] = True
     return occ, top, floor, xy_min
+
+
+def _tri_dist2d(t, px, py):
+    """점(px,py)에서 삼각형 2D 투영(XY)까지의 거리.
+
+    수직 벽 삼각형은 투영이 선분으로 퇴화 — 내부 판정+변 거리로 양쪽
+    모두 처리한다."""
+    a, b, c = t[0][:2], t[1][:2], t[2][:2]
+    # 내부면 0 (부호 면적 3개의 부호 일치)
+    d1 = (px - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (py - b[1])
+    d2 = (px - c[0]) * (b[1] - c[1]) - (b[0] - c[0]) * (py - c[1])
+    d3 = (px - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (py - a[1])
+    if not (((d1 < 0) or (d2 < 0) or (d3 < 0)) and
+            ((d1 > 0) or (d2 > 0) or (d3 > 0))):
+        return 0.0
+    best = float('inf')
+    for p, q in ((a, b), (b, c), (c, a)):
+        vx, vy = q[0] - p[0], q[1] - p[1]
+        L2 = vx * vx + vy * vy
+        s = 0.0 if L2 == 0 else max(0.0, min(
+            1.0, ((px - p[0]) * vx + (py - p[1]) * vy) / L2))
+        ex, ey = p[0] + s * vx - px, p[1] + s * vy - py
+        d = math.hypot(ex, ey)
+        if d < best:
+            best = d
+    return best
 
 
 def merge_zones(occ, top, xy_min, cell):
