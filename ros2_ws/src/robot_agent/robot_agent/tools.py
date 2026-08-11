@@ -972,8 +972,23 @@ class ToolExecutor:
                 (self.node.objects or {}).items()
                 if n2 != self.node.carrying and o.get('z', 1) < 0.35]
 
+        # ★탐색 경계 박스 — SLAM 지도(탐색 월드)는 미관측 공간이 전부
+        # '자유'라 무경계 A*가 허공으로 방황하다 반복 상한에 걸려
+        # 경로를 못 찾음 (정답 지도에선 벽이 탐색을 가둬 은폐되던
+        # 결함, 실측). 시작-목표 주변 4m 박스로 제한.
+        bx0, bx1 = min(sx, gx) - 4.0, max(sx, gx) + 4.0
+        by0, by1 = min(sy, gy) - 4.0, max(sy, gy) + 4.0
+
         def free(c):
             x, y = c[0] * res, c[1] * res
+            if not (bx0 <= x <= bx1 and by0 <= y <= by1):
+                return False
+            # ★시작점 풋프린트 클리어 — 로봇이 실제로 서 있는 자리는
+            # 자명하게 통행 가능 (SLAM 지도에선 가구 밀착/노이즈 셀의
+            # 여유 반경이 로봇 위치를 덮어 A*가 첫 셀에서 죽던 실측
+            # 결함; Nav2의 footprint clearing과 동일 관행)
+            if math.hypot(x - sx, y - sy) < 0.4:
+                return True
             # 문은 열 수 있으므로 계획상 통과 허용
             if self._cost_pen(x, y, ignore_doors=True) > 0.0:
                 return False

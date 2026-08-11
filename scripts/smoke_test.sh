@@ -83,6 +83,8 @@ else
 fi
 
 echo "=== [5] put_down 실착지 보고 ==="
+sleep 6   # [4] 픽업 후 에이전트 응답 턴 종료 대기 — 턴 중 수신 메시지
+          # 드랍('처리 중이에요')으로 인한 플레이크 방지 (실측 1회)
 T0=$(now_iso)
 send_msg "사과 내려놔"
 deadline=$((SECONDS+30)); got=""

@@ -324,6 +324,14 @@ class X2SimNode(Node):
         self.pub_odom = self.create_publisher(
             Odometry, '/slam/lidar_odom', qos_profile_sensor_data)
 
+        # 라이다 시뮬(sim_only) — 실기에선 라이다/깊이 어댑터가 같은
+        # 스키마를 발행. 에이전트의 SLAM 점유 맵핑(robot_agent.slam_map,
+        # parity)의 입력이 된다. mj_ray는 flg_static=1로 정적 지오메트리
+        # (벽/가구/문/스캔 메시)만 관측 — 로봇 몸/자유 물체 자동 제외.
+        self.pub_lidar = self.create_publisher(
+            String, '/x2_sim/lidar_scan', qos_profile_sensor_data)
+        self.create_timer(0.2, self.tick_lidar)
+
         # PMU 목 — 감쇠 배터리 (만충 54.6V → 방전한계 39V, 기본 2시간)
         # "배터리 30% 미만 경고 / 15% 미만 세션 종료" 가드를 시뮬에서
         # 테스트할 수 있게 함. battery_minutes 파라미터로 감쇠 속도 조절.
@@ -1182,15 +1190,24 @@ class X2SimNode(Node):
         self._zone_arr_names = [z[6] for z in self.block_zones]
         self._zone_tall_mask = (za[:, 5] >= 0.5) if len(za) else \
             np.zeros(0, dtype=bool)
-        # 코스트맵 발행 — 실기의 SLAM 코스트맵 대응물 (로봇이 라이다로
-        # 실시간 구축하는 정보라 '지도 유출'이 아님). 에이전트의 경로
-        # 계획(A*)이 사용. latched: 문 토글 등 갱신 시마다 재발행.
+        # 코스트맵 발행 정책:
+        # - 지도가 있는 공간(home 등 비탐색 월드) = '이전에 SLAM으로
+        #   맵핑을 마치고 저장해 둔 지도'의 대응물 → 정답 구역 발행.
+        # - ★탐색 월드(explore) = 처음 보는 공간 → 정답 지도를 주지
+        #   않는다(빈 목록 발행). 에이전트는 라이다 시뮬 기반 SLAM
+        #   점유 지도(/slam/costmap, robot_agent.slam_map)만으로
+        #   계획한다 — 실기와 동일한 인지 경로.
+        # 시뮬 내부 이동 게이팅(block_zones)은 그대로 정답 기하 사용
+        # — 그것은 지도가 아니라 '벽이 물리적으로 단단함'의 대체물.
         if hasattr(self, 'pub_costmap'):
-            door_names = set(getattr(self, 'doors', {}) or {})
-            self.pub_costmap.publish(String(data=json.dumps(
-                [[z[0], z[1], z[2], z[3], z[4],
-                  1 if z[6] in door_names else 0, round(z[5], 2)]
-                 for z in self.block_zones])))
+            if WORLDS.get(self.world_name, {}).get('explore'):
+                self.pub_costmap.publish(String(data='[]'))
+            else:
+                door_names = set(getattr(self, 'doors', {}) or {})
+                self.pub_costmap.publish(String(data=json.dumps(
+                    [[z[0], z[1], z[2], z[3], z[4],
+                      1 if z[6] in door_names else 0, round(z[5], 2)]
+                     for z in self.block_zones])))
 
     def _set_door(self, name, state, rebuild=True):
         """문 상태 전환 — open: 문설주로 접힘(시각만)/closed: 통로 차단."""
@@ -1433,6 +1450,39 @@ class X2SimNode(Node):
 
         self.cam_info.header.stamp = stamp
         self.pub_cam_info.publish(self.cam_info)
+
+    # 최저 0.22: 스캔 메시 바닥 요철/문턱(0.15 부근)이 유령 장애물로
+    # 잡히는 것 방지. 소파 시트(~0.45)는 0.22 레이가 전면을 잡는다.
+    LIDAR_HEIGHTS = (0.22, 0.5, 0.95, 1.45)
+    LIDAR_RAYS = 96
+    LIDAR_RANGE = 6.0
+
+    def tick_lidar(self):
+        """다중 높이 2D 라이다 시뮬 — 5Hz, 높이 4단 × 96방위.
+
+        높이 다단인 이유: 셀별 최고 히트 높이로 낮은 가구(앉는 면)와
+        키 큰 벽을 SLAM 지도에서 구분하기 위함 (실기의 깊이 카메라
+        포인트클라우드 대응). 원점은 베이스 중심 — 로봇 몸은
+        flg_static=1로 레이에서 제외되므로 오프셋 불필요."""
+        geomid = np.zeros(1, dtype=np.int32)
+        rays = []
+        with self.state_lock:
+            ox, oy = float(self.data.qpos[0]), float(self.data.qpos[1])
+            for h in self.LIDAR_HEIGHTS:
+                pnt = np.array([ox, oy, h])
+                for k in range(self.LIDAR_RAYS):
+                    az = 2.0 * math.pi * k / self.LIDAR_RAYS
+                    vec = np.array([math.cos(az), math.sin(az), 0.0])
+                    d = mujoco.mj_ray(self.model, self.data, pnt, vec,
+                                      None, 1, -1, geomid)
+                    if 0 < d <= self.LIDAR_RANGE:
+                        rays.append([round(az, 3), h, round(float(d), 3),
+                                     1])
+                    else:
+                        rays.append([round(az, 3), h, self.LIDAR_RANGE,
+                                     0])
+        self.pub_lidar.publish(String(data=json.dumps(
+            {'o': [round(ox, 3), round(oy, 3)], 'rays': rays})))
 
     def _warm_worlds(self):
         """모든 월드의 모델 컴파일 예열 (락 밖, CPU).

@@ -72,6 +72,11 @@ FEATURES = {
     'memory_forget': {'kind': 'ui', 'tier': 'sim_only'},  # 🧠 기억 삭제
 
     # ---------- 내부 동작 (문서화 + 점검용) ----------
+    # SLAM 점유 맵핑(robot_agent.slam_map) — 인지 계층 parity: 입력
+    # 스캔 토픽만 실기 어댑터로 갈아끼우면 무수정 동작.
+    'slam_occupancy_map': {'kind': 'internal', 'tier': 'parity'},
+    # 라이다 시뮬(mj_ray) — 실기에선 실제 라이다/깊이 드라이버가 대체
+    'lidar_sim': {'kind': 'internal', 'tier': 'sim_only'},
     'collision_block': {'kind': 'internal', 'tier': 'sim_only'},
     'velocity_ramp':   {'kind': 'internal', 'tier': 'sim_only'},
     'ondemand_render': {'kind': 'internal', 'tier': 'sim_only'},

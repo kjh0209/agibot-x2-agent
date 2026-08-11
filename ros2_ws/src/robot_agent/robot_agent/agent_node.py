@@ -79,9 +79,14 @@ class AgentNode(Node):
         latched = QoSProfile(depth=1)
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.current_world = None
+
+        def _on_world(m):
+            self.current_world = m.data
+            if hasattr(self, 'slam'):
+                self.slam.set_world(m.data)
+
         self.create_subscription(
-            String, '/x2_sim/world',
-            lambda m: setattr(self, 'current_world', m.data), latched)
+            String, '/x2_sim/world', _on_world, latched)
         # 주변 물체 + 들고 있는 물체
         import json as _json
         self.objects = {}
@@ -103,14 +108,24 @@ class AgentNode(Node):
         self.create_subscription(
             String, '/x2_sim/carrying',
             lambda m: setattr(self, 'carrying', m.data), latched3)
-        # 코스트맵 (실기 SLAM 코스트맵 대응물) — 경로 계획용
-        self.costmap = []
+        # 코스트맵 2원화 (인지 계층 parity):
+        # - costmap_sim: 지도가 있는 공간의 저장 지도 대응물 (탐색
+        #   월드에선 시뮬이 빈 목록을 발행 — 정답 열람 없음)
+        # - slam.zones: 라이다 스캔으로 로봇이 직접 구축하는 점유 지도
+        # costmap 프로퍼티가 저장 지도 우선, 없으면 SLAM 지도를 반환
+        # — tools의 A*/접근/착석 로직은 무수정.
+        self.costmap_sim = []
         latched5 = QoSProfile(depth=1)
         latched5.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.create_subscription(
             String, '/x2_sim/costmap',
-            lambda m: setattr(self, 'costmap', _json.loads(m.data)),
+            lambda m: setattr(self, 'costmap_sim', _json.loads(m.data)),
             latched5)
+        from rclpy.qos import qos_profile_sensor_data as _sqos
+        from .slam_map import SlamMapper
+        self.slam = SlamMapper(self, latched5, _sqos)
+        if self.current_world:
+            self.slam.set_world(self.current_world)
         # 자세 상세 (표면 높이 — '가구에 앉았다' 주장의 근거 데이터)
         self.posture_info = {}
         latched6 = QoSProfile(depth=1)
@@ -166,9 +181,21 @@ class AgentNode(Node):
         frac = (msg.battery_voltage - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V)
         self.battery_pct = round(max(0.0, min(1.0, frac)) * 100)
 
+    @property
+    def costmap(self):
+        """유효 코스트맵 — 저장 지도(비탐색 월드) 우선, 없으면 SLAM
+        점유 지도(탐색 월드: 로봇이 스스로 구축)."""
+        if self.costmap_sim:
+            return self.costmap_sim
+        return self.slam.zones if hasattr(self, 'slam') else []
+
     def _on_forget_map(self, msg: String):
         try:
             r = self.executor_tools.forget_map()
+            # 🧠 = '둘러보기 전 상태로' — 학습 장소·물체와 함께 SLAM
+            # 점유 지도도 초기화 (같은 파생 데이터 계층)
+            if hasattr(self, 'slam'):
+                self.slam.forget()
             self.notify_event(r.get('ok') or r.get('error') or str(r))
         except Exception as e:
             self.notify_event(f'기억 삭제 실패: {e}')
