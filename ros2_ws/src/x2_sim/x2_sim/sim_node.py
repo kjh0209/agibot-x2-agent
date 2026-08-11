@@ -629,23 +629,25 @@ class X2SimNode(Node):
         # 재방문 전환은 렌더러 생성(~0.3s)만 지불.
         if not hasattr(self, '_renderer_cache'):
             self._renderer_cache = {}
+        if not hasattr(self, '_gl_retired'):
+            self._gl_retired = []
         rc = self._renderer_cache.pop(world_name, None)
-        if rc is None:
-            rc = (mujoco.Renderer(self.model, height=self.cam_size[1],
-                                  width=self.cam_size[0]),
-                  mujoco.Renderer(self.model, height=self.prev_size[1],
-                                  width=self.prev_size[0]))
-        self._renderer_cache[world_name] = rc     # 재삽입 = 최신 표시
+        if rc is not None:
+            self._renderer_cache[world_name] = rc  # 재삽입 = 최신 표시
+            self.renderer, self.renderer_prev = rc
+        else:
+            # ★여기서 생성 금지 — Renderer 생성(mjrContext 업로드)은
+            # 호출 스레드의 TLS에 GL 컨텍스트를 바인딩한다. executor
+            # 풀 스레드에 바인딩된 컨텍스트는 나중에 안전하게 파괴할
+            # 수 없다 (교차 스레드 파괴 → llvmpipe 힙 오염 → 전 프레임
+            # 노이즈 밴드, 실측). 생성·파괴 모두 GL 전담 스레드
+            # (_preview_loop)가 수행 — None이면 그쪽에서 생성.
+            self.renderer = None
+            self.renderer_prev = None
         while len(self._renderer_cache) > 2:
             old_name = next(iter(self._renderer_cache))
-            old = self._renderer_cache.pop(old_name)
-            for r in old:
-                try:
-                    r.close()
-                except Exception:
-                    pass
-            self.get_logger().info(f'렌더러 캐시 반납: {old_name}')
-        self.renderer, self.renderer_prev = rc
+            self._gl_retired.extend(self._renderer_cache.pop(old_name))
+            self.get_logger().info(f'렌더러 캐시 반납 예약: {old_name}')
         self.get_logger().info(
             f'월드 로드: {world_name} — 소품 {len(prop_names)}개, '
             f'nq={self.model.nq}, nu={self.model.nu}')
@@ -1363,10 +1365,20 @@ class X2SimNode(Node):
         return info
 
     def tick_camera(self):
-        with self.render_lock:
-            with self.state_lock:
-                self.renderer.update_scene(self.data, camera=CAMERA_NAME)
-            rgb = self.renderer.render()      # (H, W, 3) uint8
+        """HQ 프레임 요청 — 실제 GL 작업은 GL 전담 스레드가 수행.
+
+        ★타이머/구독 콜백(executor 풀 스레드)에서 직접 렌더하면 GL
+        컨텍스트가 여러 스레드의 TLS에 바인딩돼, 월드 전환 시 폐기
+        컨텍스트를 안전하게 파괴할 방법이 없어진다 (교차 스레드 파괴
+        → llvmpipe 힙 오염 → 전 프레임 노이즈 밴드, 실측). GL은
+        _preview_loop 단일 스레드로 일원화."""
+        self._hq_request = True
+
+    def _render_hq_now(self):
+        """HQ(640x480) 렌더 + 발행 — _preview_loop(GL 스레드) 전용."""
+        with self.state_lock:
+            self.renderer.update_scene(self.data, camera=CAMERA_NAME)
+        rgb = self.renderer.render()      # (H, W, 3) uint8
         stamp = self.get_clock().now().to_msg()
 
         buf = io.BytesIO()
@@ -1425,17 +1437,53 @@ class X2SimNode(Node):
         while rclpy.ok():
             t_start = time.monotonic()
             try:
-                # render_lock 공유: 온디맨드 640 렌더와의 '동시 렌더'가
-                # OSMesa 세그폴트(2회 실측)의 유력 원인 — GL은 직렬화
+                # 이 스레드가 유일한 GL 스레드 — HQ 온디맨드 렌더와
+                # 폐기 컨텍스트 정리까지 전담 (동시 렌더 세그폴트 및
+                # 교차 스레드 컨텍스트 파괴 오염의 구조적 차단)
                 with self.render_lock, self.prev_lock:
+                    if self.renderer_prev is None:
+                        # 렌더러 생성은 GL 전담 스레드(여기)의 몫
+                        self._renderer_cache[self.world_name] = (
+                            mujoco.Renderer(self.model,
+                                            height=self.cam_size[1],
+                                            width=self.cam_size[0]),
+                            mujoco.Renderer(self.model,
+                                            height=self.prev_size[1],
+                                            width=self.prev_size[0]))
+                        self.renderer, self.renderer_prev = \
+                            self._renderer_cache[self.world_name]
+                        # 생성 직후에도 LRU 상한 적용 — 전환 시점엔 새
+                        # 렌더러가 아직 캐시에 없어 evict가 한 박자
+                        # 늦으면 캐시가 일시 3개(스캔 월드 ~0.9GB×3)로
+                        # 부풀 수 있음
+                        while len(self._renderer_cache) > 2:
+                            oldest = next(iter(self._renderer_cache))
+                            self._gl_retired.extend(
+                                self._renderer_cache.pop(oldest))
+                            self.get_logger().info(
+                                f'렌더러 캐시 반납 예약: {oldest}')
                     r = self.renderer_prev
-                    if r is None:
-                        time.sleep(0.1)
-                        continue
+                    if getattr(self, '_hq_request', False):
+                        self._hq_request = False
+                        self._render_hq_now()
                     with self.state_lock:
                         r.update_scene(self.data, camera=CAMERA_NAME,
                                        scene_option=opt)
                     rgb = r.render()
+                    # 폐기 렌더러 정리 — 위에서 현 월드 컨텍스트를 이
+                    # 스레드에 바인딩한 뒤라, 폐기 컨텍스트는 어느
+                    # 스레드에도 current가 아님 → 파괴 안전
+                    retired = getattr(self, '_gl_retired', None)
+                    if retired:
+                        # HQ 컨텍스트도 먼저 바인딩(구 HQ가 TLS에 남는
+                        # 것 방지)한 뒤 정리
+                        self._render_hq_now()
+                        while retired:
+                            try:
+                                retired.pop().close()
+                            except Exception:
+                                pass
+                        self.get_logger().info('폐기 렌더러 정리 완료')
                 buf = io.BytesIO()
                 PILImage.fromarray(rgb).save(buf, format='JPEG', quality=70)
                 msg = CompressedImage()
