@@ -231,7 +231,9 @@ class X2SimNode(Node):
         # PMU 목 — 감쇠 배터리 (만충 54.6V → 방전한계 39V, 기본 2시간)
         # "배터리 30% 미만 경고 / 15% 미만 세션 종료" 가드를 시뮬에서
         # 테스트할 수 있게 함. battery_minutes 파라미터로 감쇠 속도 조절.
-        self.declare_parameter('battery_minutes', 120.0)
+        self.declare_parameter('battery_minutes', 300.0)   # 개발 세션용
+        # (긴 개발 세션 중 15% 가드가 가짜 실패를 만들던 것 완화 —
+        #  배터리 가드 자체 테스트는 파라미터로 짧게 주면 됨)
         self.batt_v_full, self.batt_v_empty = 54.6, 39.0
         self.batt_start_time = self.data.time
         self.pub_pmu = self.create_publisher(

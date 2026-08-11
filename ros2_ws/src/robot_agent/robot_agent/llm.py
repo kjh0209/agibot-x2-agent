@@ -137,6 +137,18 @@ ALL_TOOLS = [
         },
     },
     {
+        'name': 'face',
+        'description': ('아는 대상(물체 이름/문/학습 장소)을 향해 한 번에 '
+                        '회전. "X 쪽 봐/바라봐"는 반드시 이걸 먼저 — '
+                        'turn+look을 반복하며 찾는 것은 위치를 모르는 '
+                        '대상일 때만 (최대 2회).'),
+        'input_schema': {
+            'type': 'object',
+            'properties': {'target': {'type': 'string'}},
+            'required': ['target'],
+        },
+    },
+    {
         'name': 'play_motion',
         'description': (
             '프리셋 동작 실행. 지원: WAVE_HAND(손 흔들기), RAISE_HAND(손 들기), '

@@ -27,6 +27,7 @@ FEATURES = {
     'get_status':  {'kind': 'tool', 'tier': 'parity'},
     'move':        {'kind': 'tool', 'tier': 'parity'},
     'turn':        {'kind': 'tool', 'tier': 'parity'},
+    'face':        {'kind': 'tool', 'tier': 'parity'},
     'play_motion': {'kind': 'tool', 'tier': 'parity'},
     'speak':       {'kind': 'tool', 'tier': 'parity'},
     'show_emoji':  {'kind': 'tool', 'tier': 'parity'},

@@ -477,6 +477,56 @@ class ToolExecutor:
         return {'ok': f'회전 완료: 요청 {a:.0f}°, 실제 {turned:.0f}° '
                       f'(look으로 새 방향 확인 가능)'}
 
+    def face(self, target: str):
+        """알고 있는 대상(물체/문/학습 장소)을 향해 한 번에 회전.
+
+        배경: "X를 바라봐"를 LLM이 turn+look 핑퐁(회당 10초+)으로
+        시각 사냥하던 것 — 위치를 아는 대상은 방위 계산 한 번이면 됨."""
+        args = {'target': target}
+        key = str(target).strip()
+        pos = self.node.odom
+        if pos is None:
+            return {'error': '위치 정보 없음'}
+        tgt = None
+        obj = (self.node.objects or {}).get(key)
+        if obj:
+            tgt = (obj['x'], obj['y'], f'물체 {key}')
+        if tgt is None:
+            d = (getattr(self.node, 'doors_info', {}) or {}).get(key)
+            if d:
+                tgt = (d['x'], d['y'], f'문 {key}')
+        if tgt is None:
+            from x2_sim.worlds import WORLDS
+            w = self.node.current_world
+            if WORLDS.get(w, {}).get('explore'):
+                p = self._learned(w)['places'].get(key)
+                if p:
+                    tgt = (p['pos'][0], p['pos'][1], f'장소 {key}')
+            else:
+                p = WORLDS.get('home', {}).get('places', {}).get(
+                    self.PLACES.get(key.lower(), key))
+                if p:
+                    tgt = (p['pos'][0], p['pos'][1], f'장소 {key}')
+        if tgt is None:
+            known = sorted((self.node.objects or {}).keys())
+            msg = (f'{key!r} 위치를 모름 — 아는 대상(물체: {known}, '
+                   f'학습 장소는 상태 참조)만 face 가능. 모르는 건 '
+                   f'turn+look으로 찾아야 함')
+            self.audit('face', args, False, msg)
+            return {'error': msg}
+        try:
+            self.ensure_source()
+            self.ensure_mode(int(McAction.LOCOMOTION_DEFAULT))
+        except RuntimeError as e:
+            return {'error': str(e)}
+        self._stop_requested = False
+        bearing = math.atan2(tgt[1] - pos[1], tgt[0] - pos[0])
+        self._rotate_to(bearing, timeout=12.0)
+        d = math.hypot(tgt[0] - pos[0], tgt[1] - pos[1])
+        self.audit('face', args, True, f'{tgt[2]} bearing ok d={d:.2f}')
+        return {'ok': f'{tgt[2]} 방향을 바라봄 (거리 {d:.2f}m). '
+                      f'look으로 확인 가능'}
+
     def _dock(self, max_dist=0.6, forward=False, timeout=6.0):
         """천천히 전/후진해 가구(소파·테이블 등)에 밀착. 충돌 차단으로
         위치가 더 이상 변하지 않으면(=닿음) 정지."""
