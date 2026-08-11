@@ -160,7 +160,13 @@ def part_texture(g):
 
 
 def build_occupancy(parts, cell, slice_lo=0.12, slice_hi=1.60):
-    """몸통 높이 슬라이스 삼각형 → 2D 점유 격자 + 자유(바닥) 격자."""
+    """몸통 높이 슬라이스 삼각형 → 2D 점유 격자 + 자유(바닥) 격자
+    + ★좌석면 격자 (0.15~0.60m 상향 수평면 — 등받이 의자 대응).
+
+    셀 최고 높이만으로 '낮은 가구'를 찾으면 등받이/셸이 있는 의자는
+    전부 키 큰 구역으로 분류돼 착석 감지에서 탈락한다 (회의 의자
+    실측). 앉을 수 있음의 물리적 정의는 '앉는 높이의 상향 수평면이
+    존재함'이므로 별도 격자로 추출한다."""
     allv = np.concatenate([np.asarray(g.vertices) for _, g in parts])
     xy_min = allv[:, :2].min(axis=0) - cell
     xy_max = allv[:, :2].max(axis=0) + cell
@@ -169,6 +175,7 @@ def build_occupancy(parts, cell, slice_lo=0.12, slice_hi=1.60):
     occ = np.zeros((nx, ny), bool)
     top = np.zeros((nx, ny), float)
     floor = np.zeros((nx, ny), bool)
+    seat = np.zeros((nx, ny), float)
 
     def cell_range(lo, hi):
         i0 = max(0, int((lo - xy_min[0]) / cell))
@@ -183,6 +190,17 @@ def build_occupancy(parts, cell, slice_lo=0.12, slice_hi=1.60):
         blk = (zmax > slice_lo) & (zmin < slice_hi) & \
               ~((nz > 0.7) & (zmax < 0.30))       # 낮은 상향면=바닥/단차 제외
         flr = (nz > 0.7) & (zmin < 0.25)
+        zc_tri = tris[:, :, 2].mean(axis=1)
+        st = (nz > 0.8) & (zc_tri >= 0.15) & (zc_tri <= 0.60)
+        for ti in np.nonzero(st)[0]:
+            t = tris[ti]
+            i0 = max(0, int((t[:, 0].min() - xy_min[0]) / cell))
+            i1 = min(nx - 1, int((t[:, 0].max() - xy_min[0]) / cell))
+            j0 = max(0, int((t[:, 1].min() - xy_min[1]) / cell))
+            j1 = min(ny - 1, int((t[:, 1].max() - xy_min[1]) / cell))
+            zt = float(zc_tri[ti])
+            sub = seat[i0:i1 + 1, j0:j1 + 1]
+            np.maximum(sub, zt, out=sub)
         for sel, grid, keep_top in ((blk, occ, True), (flr, floor, False)):
             idx = np.nonzero(sel)[0]
             for ti in idx:
@@ -208,7 +226,47 @@ def build_occupancy(parts, cell, slice_lo=0.12, slice_hi=1.60):
                 else:
                     # 바닥(자유 공간 후보)은 과대 마킹이 무해 — AABB 유지
                     grid[i0:i1 + 1, j0:j1 + 1] = True
-    return occ, top, floor, xy_min
+    return occ, top, floor, seat, xy_min
+
+
+def merge_seats(seat, xy_min, cell):
+    """좌석면 셀 → 높이 버킷(0.1m) 행 런 병합 박스 [[cx,cy,hx,hy,h]]."""
+    boxes = []
+    nx, ny = seat.shape
+    for j in range(ny):
+        i = 0
+        while i < nx:
+            if seat[i, j] <= 0:
+                i += 1
+                continue
+            k = i
+            hb = round(seat[i, j], 1)
+            hmax = seat[i, j]
+            while k + 1 < nx and seat[k + 1, j] > 0 and \
+                    round(seat[k + 1, j], 1) == hb:
+                k += 1
+                hmax = max(hmax, seat[k, j])
+            boxes.append([round(xy_min[0] + (i + k + 1) / 2 * cell, 3),
+                          round(xy_min[1] + (j + 0.5) * cell, 3),
+                          round((k - i + 1) / 2 * cell, 3),
+                          round(cell / 2, 3), round(float(hmax), 2)])
+            i = k + 1
+    # 세로 병합 (동일 x-범위·높이 버킷)
+    merged = []
+    boxes.sort(key=lambda b: (b[0], b[2], b[1]))
+    for b in boxes:
+        if merged and merged[-1][0] == b[0] and merged[-1][2] == b[2] \
+                and abs((merged[-1][1] + merged[-1][3]) - (b[1] - b[3])) \
+                < 1e-6 and abs(merged[-1][4] - b[4]) < 0.1:
+            m = merged[-1]
+            new_low = m[1] - m[3]
+            new_high = b[1] + b[3]
+            m[1] = round((new_low + new_high) / 2, 3)
+            m[3] = round((new_high - new_low) / 2, 3)
+            m[4] = max(m[4], b[4])
+        else:
+            merged.append(list(b))
+    return merged
 
 
 def _tri_dist2d(t, px, py):
@@ -365,19 +423,20 @@ def main():
         meta_parts.append(entry)
 
     # 점유/자유 분석은 (데시메이션 전) 원본 지오메트리로 — 이미 변환 적용됨
-    occ, top, floor, xy_min = build_occupancy(parts, cell)
+    occ, top, floor, seat, xy_min = build_occupancy(parts, cell)
     zones = merge_zones(occ, top, xy_min, cell)
+    seats = merge_seats(seat, xy_min, cell)
     spawn, free = free_space(occ, floor, xy_min, cell)
     allv = np.concatenate([np.asarray(g.vertices) for _, g in parts])
     bbox = [allv[:, 0].min(), allv[:, 1].min(),
             allv[:, 0].max(), allv[:, 1].max()]
-    meta = {'parts': meta_parts, 'zones': zones, 'spawn': spawn,
-            'free': free, 'cell': cell,
+    meta = {'parts': meta_parts, 'zones': zones, 'seats': seats,
+            'spawn': spawn, 'free': free, 'cell': cell,
             'bbox': [round(float(b), 3) for b in bbox]}
     with open(os.path.join(outdir, 'meta.json'), 'w') as fp:
         json.dump(meta, fp)
-    print(f'zones={len(zones)} spawn={spawn} free={len(free)} '
-          f'bbox={meta["bbox"]}')
+    print(f'zones={len(zones)} seats={len(seats)} spawn={spawn} '
+          f'free={len(free)} bbox={meta["bbox"]}')
 
 
 if __name__ == '__main__':

@@ -917,11 +917,15 @@ class ToolExecutor:
             nx = max(z[0] - z[2], min(pos[0], z[0] + z[2]))
             ny = max(z[1] - z[3], min(pos[1], z[1] + z[3]))
             d = math.hypot(nx - pos[0], ny - pos[1])
-            if best is None or d < best[0]:
-                best = (d, nx, ny, z)
-        if best is None or best[0] <= 0.55 or best[0] > 3.0:
+            # 의자 높이 대역(0.35~0.55) 선호 — 창턱/단차(0.2~0.3)에
+            # 걸터앉아 벽을 보는 것보다 제대로 된 좌석을 고른다
+            # (인체공학 기준의 범용 선호이지 특정 가구 지식이 아님)
+            score = d + (0.0 if z[6] >= 0.35 else 1.5)
+            if best is None or score < best[0]:
+                best = (score, nx, ny, z, d)
+        if best is None or best[4] <= 0.55 or best[4] > 3.0:
             return                       # 없음/이미 옆/너무 멂 → 그대로
-        d, ex, ey, z = best
+        _, ex, ey, z, d = best
         ux = (pos[0] - ex) / max(d, 0.1)
         uy = (pos[1] - ey) / max(d, 0.1)
         # 0.32m: 내비 통과 반경(0.35)과 합친 최악 거리 0.67m가

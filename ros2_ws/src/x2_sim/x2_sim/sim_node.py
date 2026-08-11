@@ -483,6 +483,13 @@ class X2SimNode(Node):
                 smeta = json.load(fp)
             self._scan_zones = list(smeta.get('zones', []))
             self._scan_spawn = smeta.get('spawn')
+            # 좌석면 지도 — 등받이 의자의 앉는 면(셀 최고 높이는
+            # 등받이라 '낮은 가구' 판정 탈락) 대응. 물리 계층(착석
+            # 실행)의 표면 정보라 정답 기하 사용이 정당 — 게이팅과
+            # 동일 원칙.
+            self._scan_seats = smeta.get('seats', [])
+        else:
+            self._scan_seats = []
             # ★경계 봉쇄 — 실제 스캔엔 구멍(미촬영 창/개구부)이 있어
             # 로봇이 스캔 밖 허공으로 걸어나가는 사고 실측 (탐색이
             # 허공에서 '사무실'을 학습). bbox 4변을 키 큰 구역으로
@@ -792,8 +799,14 @@ class X2SimNode(Node):
     }
 
     def _platform_top(self, x, y):
-        """(x,y) 아래의 낮은 가구(침대/소파 등) 윗면 높이. 없으면 0."""
+        """(x,y) 아래의 앉을 수 있는 면 높이. 없으면 0.
+
+        ①스캔 월드 좌석면 지도(상향 수평면 0.15~0.6m — 등받이 위
+        존재 무관) 우선, ②구역 최고 높이<0.6 (박스 월드 가구)."""
         best = 0.0
+        for (cx, cy, hx, hy, h) in getattr(self, '_scan_seats', []):
+            if abs(x - cx) <= hx + 0.05 and abs(y - cy) <= hy + 0.05:
+                best = max(best, h)
         for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
             if top < 0.6 and abs(x - cx) <= hx + 0.05 \
                     and abs(y - cy) <= hy + 0.05:
@@ -808,16 +821,25 @@ class X2SimNode(Node):
         윗면 높이) 또는 None."""
         c, ss = math.cos(self.base_yaw), math.sin(self.base_yaw)
         px, py = -ss, c                 # 좌측 수직 방향
+        fallback = None
         for d in dists:
-            for off in (0.0, 0.28, -0.28):
+            # ±0.14 추가 — 의자처럼 폭 0.4m대 가구는 0/±0.28 3점
+            # 샘플링 사이로 빠질 수 있음 (회의 의자 실측)
+            for off in (0.0, 0.14, -0.14, 0.28, -0.28):
                 x = (self.base_xyz[0] + direction * d * c + off * px)
                 y = (self.base_xyz[1] + direction * d * ss + off * py)
                 top = self._platform_top(x, y)
                 if top > 0.05:
                     gx = direction * d * c + off * px
                     gy = direction * d * ss + off * py
-                    return gx, gy, top
-        return None
+                    # 의자 높이 대역(0.35m~)은 즉시 채택, 낮은 면
+                    # (문턱/창턱 0.2m대)은 대역 후보가 없을 때만 —
+                    # 문턱에 걸터앉아 벽 보는 것 방지 (범용 선호)
+                    if top >= 0.35:
+                        return gx, gy, top
+                    if fallback is None:
+                        fallback = (gx, gy, top)
+        return fallback
 
     def set_posture(self, posture: str):
         """자세 전환 (stand/sit/lie) — 1.5s 램프, ★가구 범용.
