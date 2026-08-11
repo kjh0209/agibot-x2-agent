@@ -849,6 +849,17 @@ class ToolExecutor:
         '규칙: 확실할 때만 yes. 비슷하지만 다른 가구면 no + actual에 '
         '실제 이름.')
 
+    def _max_clearance_heading(self):
+        """12방위 중 장애물까지가 가장 먼 방향 — '트인 쪽 보기'용."""
+        best_hd, best_d = self.node.yaw_rad(), -1.0
+        for k in range(12):
+            hd = k * math.pi / 6.0
+            d = self._obstacle_ahead(hd)
+            d = 6.0 if d is None else d
+            if d > best_d:
+                best_hd, best_d = hd, d
+        return best_hd
+
     def _verify_view(self, label):
         """현장 검증 — 지금 시야에 label이 실제로 보이는가.
 
@@ -958,12 +969,19 @@ class ToolExecutor:
                 near = [v for v in votes
                         if math.hypot(v[0] - pos[0], v[1] - pos[1]) < 3.0]
                 if len(near) >= 2 and room not in lm['rooms']:
-                    cx = sum(v[0] for v in near) / len(near)
-                    cy = sum(v[1] for v in near) / len(near)
-                    lm['rooms'][room] = [round(cx, 2), round(cy, 2)]
+                    # ★위치 = 지금 서 있는 지점 — 확정 투표 순간의 로봇
+                    # 위치라 보행 가능이 보장된다. 투표 중심점은 두 유효
+                    # 지점 '사이'의 가구 위에 떨어질 수 있음 ('방'이
+                    # 소파 뒤에 박혀 코를 박던 실측 사고).
+                    px, py = round(pos[0], 2), round(pos[1], 2)
+                    lm['rooms'][room] = [px, py]
+                    # 도착 방향 = 시야가 가장 트인 쪽 — 도착 첫 화면이
+                    # 쿠션/벽 클로즈업이 되지 않게
                     lm['places'].setdefault(
-                        room, {'pos': [round(cx, 2), round(cy, 2)],
-                               'yaw': round(yaw, 2)})
+                        room, {'pos': [px, py],
+                               'yaw': round(
+                                   self._max_clearance_heading(), 2),
+                               'verified': True})
                     self.node.notify_event(
                         f'탐사: 여기는 {room} (2회 관측 일치 → 확정)')
             for o in (res.get('objects') or []):
