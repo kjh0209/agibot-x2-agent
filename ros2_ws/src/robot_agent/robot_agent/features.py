@@ -56,6 +56,10 @@ FEATURES = {
     # 미지 공간 탐색·학습 — 실기는 SLAM 자율 탐색으로 재구현 (Phase 6.5+)
     'explore':        {'kind': 'tool', 'tier': 'real_needs_work',
                        'real_available': False},
+    # 완전 탐사(수렴 조건: 프론티어 소진+스캔 커버리지) — explore와
+    # 같은 SLAM/내비 기반이라 실기 요건 동일
+    'survey_map':     {'kind': 'tool', 'tier': 'real_needs_work',
+                       'real_available': False},
     'remember_place': {'kind': 'tool', 'tier': 'real_needs_work',
                        'real_available': False},
     # 눕기 — 실기 v1 제외 (낙상 유사 자세라 안전 검토 필요)
@@ -71,6 +75,9 @@ FEATURES = {
 
     # ---------- UI ----------
     'world_switch':  {'kind': 'ui', 'tier': 'sim_only'},  # 🌍 드롭다운
+    # 🗺️ 완전 탐사 버튼 — 실기는 survey_map 실기화와 함께 개방
+    'map_survey':    {'kind': 'ui', 'tier': 'real_needs_work',
+                      'real_available': False},
     'sim_reset':     {'kind': 'ui', 'tier': 'sim_only'},  # 🔄 리셋 버튼
     'memory_forget': {'kind': 'ui', 'tier': 'sim_only'},  # 🧠 기억 삭제
 

@@ -257,6 +257,49 @@ class ToolExecutor:
                     f'움직임을 거절함. 충전이 필요함 (안전 가드)')
         return None
 
+    # ---------- 주행 안전 반사층 (추돌 방지 — 실기 대비) ----------
+    # 계획(A*)·게이팅과 독립인 최하위 반사: 진행 방향 원뿔의 최근접
+    # 장애물이 SAFE_STOP 이내면 즉시 정지, SAFE_SLOW 이내면 저속.
+    # 입력: ①라이다 스캔(시뮬은 정적 기하 — ★실기 어댑터는 사람 포함
+    # 전체가 잡힘) ②감지된 동적 물체 목록. 사람/물건/문 무엇이든
+    # '거리'로만 판단하는 범용 규칙.
+    SAFE_STOP = 0.42     # m — 이내면 즉시 정지
+    SAFE_SLOW = 0.95     # m — 이내면 0.15m/s 이하로 감속
+    SAFE_CONE = 0.6      # rad — 진행 방향 ±34°
+    SAFE_MIN = 0.15      # m — 라이다 최소 유효 거리(블랭킹 존).
+    # 실기 라이다 스펙 대응 + ★몸이 얇은 지오메트리(커튼 등)에 파묻힌
+    # 비정상 상태에서 전방위 근접 히트가 탈출까지 막는 교착 방지
+    # (정상 주행에선 0.42에서 먼저 멈추므로 0.15 미만에 도달 불가)
+
+    def _obstacle_ahead(self, heading):
+        """진행 방향 원뿔의 최근접 장애물 거리(m). 정보 없으면 None."""
+        best = None
+        slam = getattr(self.node, 'slam', None)
+        scan = getattr(slam, 'last_scan', None) if slam else None
+        if scan is not None and \
+                time.monotonic() - getattr(slam, 'last_scan_t', 0) < 1.2:
+            for az, h, dist, hit in scan.get('rays', []):
+                if not hit or h > 1.0:      # 머리 위 상인방 등 제외
+                    continue
+                if dist < self.SAFE_MIN:    # 블랭킹 존 — 무효 판독
+                    continue
+                e = abs((az - heading + math.pi) % (2 * math.pi)
+                        - math.pi)
+                if e < self.SAFE_CONE and (best is None or dist < best):
+                    best = dist
+        pos = self.node.odom
+        if pos:
+            for nm, o in (self.node.objects or {}).items():
+                if nm == self.node.carrying:
+                    continue
+                dx, dy = o['x'] - pos[0], o['y'] - pos[1]
+                d = math.hypot(dx, dy) - 0.25   # 물체 반경 여유
+                e = abs((math.atan2(dy, dx) - heading + math.pi)
+                        % (2 * math.pi) - math.pi)
+                if e < self.SAFE_CONE and (best is None or d < best):
+                    best = max(0.0, d)
+        return best
+
     def move(self, vx=0.0, vy=0.0, wz=0.0, duration=1.0, wait=False):
         args = {'vx': vx, 'vy': vy, 'wz': wz, 'duration': duration,
                 'wait': wait}
@@ -292,7 +335,24 @@ class ToolExecutor:
             msg.lateral_velocity = vy
             msg.angular_velocity = wz
             t_end = time.monotonic() + duration
+            safety_note = ''
+            sp = math.hypot(vx, vy)
             while time.monotonic() < t_end and not self._stop_requested:
+                # 안전 반사층: 진행 방향 장애물 정지/감속
+                if sp > 0.05:
+                    hd = self.node.yaw_rad() + math.atan2(vy, vx)
+                    d_ob = self._obstacle_ahead(hd)
+                    if d_ob is not None and d_ob < self.SAFE_STOP:
+                        safety_note = (f' — 안전 정지: 전방 {d_ob:.2f}m '
+                                       f'장애물(사람/물건일 수 있음)')
+                        break
+                    if d_ob is not None and d_ob < self.SAFE_SLOW:
+                        k = 0.15 / sp
+                        msg.forward_velocity = vx * k
+                        msg.lateral_velocity = vy * k
+                    else:
+                        msg.forward_velocity = vx
+                        msg.lateral_velocity = vy
                 self.pub_vel.publish(msg)
                 time.sleep(0.1)
             msg.forward_velocity = 0.0
@@ -310,7 +370,8 @@ class ToolExecutor:
                 if expect > 0.05 and dist < expect * 0.3:
                     actual += (' ← 명령보다 훨씬 적음! 장애물 차단 또는 '
                                '제어권 상실(리모컨 개입) 가능성')
-            done = f'이동 종료: vx={vx} vy={vy} wz={wz} {duration}s{stopped}{actual}'
+            done = (f'이동 종료: vx={vx} vy={vy} wz={wz} {duration}s'
+                    f'{stopped}{safety_note}{actual}')
             self.audit('move_done', args, True, done)
             self.node.notify_event(done)
 
@@ -906,6 +967,168 @@ class ToolExecutor:
         self.audit('explore', args, True, summary)
         return {'ok': summary}
 
+    def _door_curiosity(self, lm, pos):
+        """근처 문 학습 + 닫힌 문 열어보기 (explore와 동일 동작)."""
+        if not hasattr(self, '_explore_opened'):
+            self._explore_opened = set()
+        for dn, dd in (getattr(self.node, 'doors_info', {}) or {}).items():
+            ddist = math.hypot(dd['x'] - pos[0], dd['y'] - pos[1])
+            if ddist < 2.5:
+                lm.setdefault('doors', {})[dn] = {'x': dd['x'],
+                                                  'y': dd['y']}
+            if (dd.get('state') == 'closed' and ddist < 2.5
+                    and dn not in self._explore_opened):
+                self._explore_opened.add(dn)
+                ux = (pos[0] - dd['x']) / max(ddist, 0.1)
+                uy = (pos[1] - dd['y']) / max(ddist, 0.1)
+                front = (dd['x'] + 0.85 * ux, dd['y'] + 0.85 * uy)
+                wps = self._plan_path(pos, front) or [front]
+                ok, _ = self._navigate(wps, timeout=25.0)
+                if ok or ddist < 1.35:
+                    self.pub_door.publish(String(data='open'))
+                    self.node.notify_event(
+                        f'탐사: 닫힌 문({dn}) 발견 — 열어봄')
+                    time.sleep(1.3)
+
+    def survey_map(self, max_minutes: float = 15):
+        """공간 완전 파악 — 시간제가 아니라 ★수렴 조건으로 종료.
+
+        ① 프론티어 소진: SLAM 지도의 자유·미지 경계 중 도달 가능한
+           곳이 없어질 때까지 반복 방문 (기하 커버리지 완결)
+        ② 스캔 커버리지: 알려진 모든 자유 공간이 어느 VLM 스캔
+           지점의 2.5m 반경 안에 들 때까지 보충 스캔 (의미 커버리지)
+        ③ 안전핀: 정보 증가 정체 4라운드 / max_minutes / 정지 요청
+        스캔 지점은 학습 지도에 영속 — 재실행 시 이어서 진행."""
+        from x2_sim.worlds import WORLDS
+        world = self.node.current_world
+        args = {'max_minutes': max_minutes}
+        if not WORLDS.get(world, {}).get('explore'):
+            msg = '이 공간은 이미 지도가 있는 곳 — 탐색 모드 공간 전용'
+            self.audit('survey_map', args, False, msg)
+            return {'error': msg}
+        guard = self._battery_guard()
+        if guard:
+            return {'error': guard}
+        slam = getattr(self.node, 'slam', None)
+        if slam is None:
+            return {'error': 'SLAM 맵퍼 없음'}
+        try:
+            self.ensure_source()
+            self.ensure_mode(int(McAction.LOCOMOTION_DEFAULT))
+        except RuntimeError as e:
+            return {'error': str(e)}
+        self._stop_requested = False
+        self._explore_opened = set()
+        lm = self._learned(world)
+        scan_pts = [tuple(p) for p in lm.get('scan_pts', [])]
+        t0 = time.monotonic()
+        t_end = t0 + max(3.0, min(30.0, float(max_minutes))) * 60.0
+        blocked = []
+
+        def _blk(p):
+            return any(math.hypot(p[0] - b[0], p[1] - b[1]) < 0.5
+                       for b in blocked)
+
+        def _scan_here():
+            self._scan_and_register(lm, world)
+            p2 = self.node.odom or (0.0, 0.0)
+            scan_pts.append((round(p2[0], 2), round(p2[1], 2)))
+
+        def _need_scan(pos):
+            return all(math.hypot(pos[0] - s[0], pos[1] - s[1]) > 2.2
+                       for s in scan_pts)
+
+        self.node.notify_event(
+            '완전 탐사 시작 — 미지 경계가 사라질 때까지 (수 분 소요)')
+        rounds, stagnant, last_area = 0, 0, -1.0
+        # ---- 1단계: 프론티어 소진 (기하 커버리지) ----
+        while time.monotonic() < t_end and not self._stop_requested:
+            pos = self.node.odom
+            if pos is None:
+                break
+            lm['cells'].add(self._cell(*pos))
+            self._door_curiosity(lm, pos)
+            if _need_scan(pos):
+                _scan_here()
+            fr = [f for f in slam.frontiers() if not _blk(f)]
+            if not fr:
+                self.node.notify_event('완전 탐사: 미지 경계 소진 — '
+                                       '기하 커버리지 완료')
+                break
+            fr.sort(key=lambda f: math.hypot(f[0] - pos[0],
+                                             f[1] - pos[1]))
+            moved = False
+            for f in fr[:6]:
+                wps = self._plan_path(pos, f)
+                if wps is None:
+                    blocked.append(f)
+                    continue
+                ok, detail = self._navigate(wps, timeout=45.0)
+                if ok:
+                    moved = True
+                    break
+                if 'stop' in (detail or ''):
+                    self._stop_requested = True
+                    break
+                blocked.append(f)
+            rounds += 1
+            area = slam.known_area_m2()
+            if rounds % 3 == 0:
+                self.node.notify_event(
+                    f'완전 탐사: 지도 {area:.0f}㎡ / 미지 경계 '
+                    f'{len(fr)}곳 / 스캔 {len(scan_pts)}회')
+            if not moved:
+                self.node.notify_event(
+                    '완전 탐사: 남은 미지 경계는 전부 도달 불가 — '
+                    '기하 커버리지 종료')
+                break
+            if area - last_area < 0.3:
+                stagnant += 1
+                if stagnant >= 4:
+                    break
+            else:
+                stagnant = 0
+            last_area = area
+        # ---- 2단계: 스캔 커버리지 보충 (의미 커버리지) ----
+        while time.monotonic() < t_end and not self._stop_requested:
+            pos = self.node.odom or (0.0, 0.0)
+            gaps = [c for c in slam.free_cells()
+                    if not _blk(c) and all(
+                        math.hypot(c[0] - s[0], c[1] - s[1]) > 2.5
+                        for s in scan_pts)]
+            if not gaps:
+                break
+            gaps.sort(key=lambda c: math.hypot(c[0] - pos[0],
+                                               c[1] - pos[1]))
+            target = gaps[0]
+            wps = self._plan_path(pos, target)
+            if wps is None:
+                blocked.append(target)
+                continue
+            ok, detail = self._navigate(wps, timeout=60.0)
+            if 'stop' in (detail or ''):
+                break
+            if not ok:
+                blocked.append(target)
+                continue
+            _scan_here()
+        lm['scan_pts'] = [list(p) for p in scan_pts]
+        self._save_learned(world)
+        slam.save()
+        fr_left = len([f for f in slam.frontiers() if not _blk(f)])
+        dt = (time.monotonic() - t0) / 60.0
+        state = ('사용자 정지로 중단' if self._stop_requested else
+                 ('시간 상한 도달 — 재실행 시 이어서 진행' if
+                  time.monotonic() >= t_end else '수렴 완료 — 이 공간은 '
+                  '이제 지도가 있는 공간처럼 파악됨'))
+        summary = (f'완전 탐사 종료({dt:.1f}분, {state}) — 지도 '
+                   f'{slam.known_area_m2():.0f}㎡, 잔여 도달가능 미지 '
+                   f'경계 {fr_left}곳, 방 {sorted(lm["rooms"])}, 장소 '
+                   f'{sorted(lm["places"])}, 물체 '
+                   f'{sorted(lm["objects_seen"])}, 스캔 {len(scan_pts)}회')
+        self.audit('survey_map', args, True, summary)
+        return {'ok': summary}
+
     def _approach_nearest_seat(self):
         """가장 가까운 '앉을 수 있는 가구'(코스트맵 top 0.15~0.55) 옆까지
         A* 접근 후 가구를 바라보게 정렬. 없거나 이미 옆이면 그냥 통과.
@@ -1458,7 +1681,13 @@ class ToolExecutor:
                     if retried < 3:
                         # 언스턱 3단: ①후진 1.5s ②좌측 이동 1.2s
                         # ③우측 이동 2.0s(좌측 복귀분 포함) — 문틀이
-                        # 어느 쪽에 있는지 모르므로 양방향 시도
+                        # 어느 쪽에 있는지 모르므로 양방향 시도.
+                        # 후진 전 후방 반사 확인 (등 뒤 사람/물건 보호)
+                        if retried == 0:
+                            d_rear = self._obstacle_ahead(
+                                self.node.yaw_rad() + m.pi)
+                            if d_rear is not None and d_rear < 0.5:
+                                retried = 1     # 후진 생략 → 측면부터
                         msg.forward_velocity = (-0.2 if retried == 0
                                                 else 0.0)
                         msg.lateral_velocity = (0.0, 0.15, -0.15)[retried]
@@ -1495,6 +1724,24 @@ class ToolExecutor:
                 speed = MAX_VX * max(0.0, 1.0 - abs(err) / 0.7)
                 # 목적지 근접 시 감속 (마지막 0.5m 구간)
                 speed = min(speed, MAX_VX * max(0.4, dist / 0.5))
+                # 안전 반사층: 전방(현재 몸 방향) 장애물 정지/감속.
+                # 정지 상태로 대기 — 동적 장애물(사람)이면 비켜난 뒤
+                # 재개, 계속 막혀 있으면 진행 감시가 언스틱/실패 처리
+                # → 호출측이 갱신된 SLAM 지도로 재계획.
+                # ★목표 0.6m 이내는 도킹 모드(0.18m까지 완화) — 좌석
+                # 0.32m 밀착 등 의도적 근접이 반사층에 막히지 않게
+                # (속도는 이미 저속 캡)
+                stop_d = self.SAFE_STOP if dist > 0.6 else 0.18
+                d_ob = self._obstacle_ahead(self.node.yaw_rad())
+                if d_ob is not None and d_ob < stop_d \
+                        and speed > 0.0:
+                    msg.forward_velocity = 0.0
+                    msg.angular_velocity = max(-0.5, min(0.5, 1.2 * err))
+                    self.pub_vel.publish(msg)
+                    time.sleep(0.1)
+                    continue
+                if d_ob is not None and d_ob < self.SAFE_SLOW:
+                    speed = min(speed, 0.15)
                 msg.forward_velocity = speed
                 msg.angular_velocity = max(-0.5, min(0.5, 1.2 * err))
                 self.pub_vel.publish(msg)

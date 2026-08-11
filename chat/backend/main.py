@@ -72,6 +72,8 @@ class Bridge(Node):
             String, '/agent/hard_stop', 10)
         self.pub_forget = self.create_publisher(
             String, '/agent/forget_map', 10)
+        self.pub_survey = self.create_publisher(
+            String, '/agent/survey', 10)
         self.reset_cli = self.create_client(Trigger, '/x2_sim/reset')
         # 월드 전환 (latched 구독으로 현재 월드 추적)
         from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -248,6 +250,15 @@ async def status():
 async def stop():
     bridge.hard_stop()
     return Response('정지 발행 완료 (LLM 독립 경로)', media_type='text/plain')
+
+
+@app.post('/survey')
+async def survey():
+    """🗺️ 완전 탐사 — 미지 경계 소진 + 스캔 커버리지까지 자율 탐사.
+    장시간(수 분) 백그라운드 실행, 진행은 이벤트로 중계."""
+    bridge.pub_survey.publish(String(data='ui_button'))
+    return Response('완전 탐사 시작 — 진행 상황은 채팅 알림으로 중계됩니다',
+                    media_type='text/plain')
 
 
 @app.post('/forget')

@@ -122,6 +122,10 @@ class SlamMapper:
             d = json.loads(msg.data)
         except Exception:
             return
+        # 최신 스캔 보관 — 주행 안전 반사층(_obstacle_ahead)이 사용
+        import time as _t
+        self.last_scan = d
+        self.last_scan_t = _t.monotonic()
         ox, oy = d['o'][0], d['o'][1]
         h_min = min((r[1] for r in d.get('rays', [])), default=0.0)
         for az, h, dist, hit in d.get('rays', []):
@@ -138,7 +142,9 @@ class SlamMapper:
                          (ys < self.N)
                     self.logodds[xs[ok], ys[ok]] = np.maximum(
                         L_MIN, self.logodds[xs[ok], ys[ok]] - L_FREE)
-            if hit:
+            if hit and dist >= 0.2:
+                # 0.2m 미만 히트 제외 — 라이다 최소 유효 거리(실기 스펙)
+                # + 자기 위치 셀이 점유로 오염되는 것 방지
                 i, j = self._cell(ox + dist * ca, oy + dist * sa)
                 if 0 <= i < self.N and 0 <= j < self.N:
                     self.logodds[i, j] = min(
@@ -147,6 +153,40 @@ class SlamMapper:
                         self.top[i, j] = h + 0.05
         self._scan_count += 1
         self._dirty = True
+
+    # ---------- 완전 탐사(survey) 지원 ----------
+    def frontiers(self):
+        """프론티어 셀 좌표 목록 — 자유 셀 중 미지 셀과 인접한 것.
+
+        완전 탐사의 수렴 판정: 도달 가능한 프론티어가 없으면 로봇이
+        갈 수 있는 모든 공간이 관측 완료된 것."""
+        free = self.logodds < -0.5
+        unk = np.abs(self.logodds) < 0.3
+        adj = np.zeros_like(unk)
+        adj[1:, :] |= unk[:-1, :]
+        adj[:-1, :] |= unk[1:, :]
+        adj[:, 1:] |= unk[:, :-1]
+        adj[:, :-1] |= unk[:, 1:]
+        idx = np.argwhere(free & adj)
+        return [(float(i * RES - HALF + RES / 2),
+                 float(j * RES - HALF + RES / 2)) for i, j in idx]
+
+    def free_cells(self, sub=4):
+        """알려진 자유 셀 좌표 (sub칸 간격 서브샘플) — 스캔 커버리지
+        판정용."""
+        free = self.logodds < -0.5
+        idx = np.argwhere(free)
+        out = []
+        for i, j in idx:
+            if i % sub or j % sub:
+                continue
+            out.append((float(i * RES - HALF + RES / 2),
+                        float(j * RES - HALF + RES / 2)))
+        return out
+
+    def known_area_m2(self):
+        known = (np.abs(self.logodds) > 0.3).sum()
+        return float(known) * RES * RES
 
     # ---------- 구역 병합·발행 ----------
     def _tick(self):

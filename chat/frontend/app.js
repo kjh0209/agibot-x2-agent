@@ -132,6 +132,16 @@ document.getElementById('btn-forget').addEventListener('click', () => {
       setTimeout(() => (ctlMsg.textContent = ''), 4000);
     });
 });
+document.getElementById('btn-survey').addEventListener('click', () => {
+  if (!confirm('완전 탐사를 시작합니다 — 로봇이 미지 경계가 사라지고\n모든 구역이 스캔될 때까지 자율 이동합니다 (수 분 소요).\n중지는 🛑 즉시 정지. 계속할까요?')) return;
+  ctlMsg.textContent = '완전 탐사 시작…';
+  fetch('/survey', { method: 'POST' })
+    .then(r => r.text()).then(t => {
+      ctlMsg.textContent = t;
+      addMsg('sys', '🗺️ ' + t);
+      setTimeout(() => (ctlMsg.textContent = ''), 5000);
+    });
+});
 document.getElementById('btn-reset').addEventListener('click', () => {
   ctlMsg.textContent = '초기화 중…';
   fetch('/reset', { method: 'POST' })
@@ -156,6 +166,10 @@ fetch('/features').then(r => r.json()).then(f => {
   }
   if (!f.ui.memory_forget) {
     const el = document.getElementById('btn-forget');
+    if (el) el.style.display = 'none';
+  }
+  if (!f.ui.map_survey) {
+    const el = document.getElementById('btn-survey');
     if (el) el.style.display = 'none';
   }
 }).catch(() => {});

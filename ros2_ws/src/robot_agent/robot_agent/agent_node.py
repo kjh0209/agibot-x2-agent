@@ -145,6 +145,9 @@ class AgentNode(Node):
         # 🧠 기억 삭제 (UI 버튼 하드와이어 경로 — LLM 무경유)
         self.create_subscription(
             String, '/agent/forget_map', self._on_forget_map, 10)
+        # 🗺️ 완전 탐사 (UI 버튼 하드와이어 경로 — 장시간 백그라운드)
+        self.create_subscription(
+            String, '/agent/survey', self._on_survey, 10)
 
         # ---------- 출력 ----------
         self.pub_reply = self.create_publisher(String, '/agent/reply', 10)
@@ -188,6 +191,26 @@ class AgentNode(Node):
         if self.costmap_sim:
             return self.costmap_sim
         return self.slam.zones if hasattr(self, 'slam') else []
+
+    def _on_survey(self, msg: String):
+        """완전 탐사 버튼 — 백그라운드 스레드로 실행 (수 분 소요),
+        진행 상황은 notify_event로 중계. 중복 실행 차단."""
+        import threading as _th
+        t = getattr(self, '_survey_thread', None)
+        if t is not None and t.is_alive():
+            self.notify_event('완전 탐사가 이미 진행 중 — 중지는 즉시 '
+                              '정지 버튼')
+            return
+
+        def _run():
+            try:
+                r = self.executor_tools.survey_map()
+                self.notify_event(str(r.get('ok') or r.get('error')))
+            except Exception as e:
+                self.notify_event(f'완전 탐사 실패: {e}')
+
+        self._survey_thread = _th.Thread(target=_run, daemon=True)
+        self._survey_thread.start()
 
     def _on_forget_map(self, msg: String):
         try:
