@@ -28,6 +28,10 @@ body { background:#0f1115; color:#e8e8e8; font-family:'Apple SD Gothic Neo',
 #btn-reset:hover { background:#9b59b6; }
 #btn-voice { background:#16697a; }
 #btn-voice.off { background:#3a3f4a; color:#8b93a2; }
+#btn-forget { background:#b03a67; }
+#btn-forget:hover { background:#c74d7a; }
+#btn-survey { background:#2e7d4f; }
+#btn-survey:hover { background:#3a9663; }
 #world-sel { background:#1a1e25; color:#eee; border:1px solid #2b303b;
              border-radius:9px; padding:10px 12px; font-size:14px;
              cursor:pointer; margin-top:14px; }
