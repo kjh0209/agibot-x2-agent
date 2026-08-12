@@ -205,7 +205,7 @@ class SlamMapper:
         doors = [(v.get('x', 0), v.get('y', 0))
                  for v in (getattr(self.node, 'doors_info', {}) or
                            {}).values()]
-        tall = self.top >= 0.5
+        tall = self.top >= 0.68   # 침대(~0.6m)는 낮은 가구
         # 행 런 → 세로 동일 런 병합 (변환기와 동일 접근) — 구역 수를
         # 수백 → 수십으로 줄여 A* 비용을 억제
         runs = {}

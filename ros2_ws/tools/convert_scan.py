@@ -191,7 +191,7 @@ def build_occupancy(parts, cell, slice_lo=0.12, slice_hi=1.60):
               ~((nz > 0.7) & (zmax < 0.30))       # 낮은 상향면=바닥/단차 제외
         flr = (nz > 0.7) & (zmin < 0.25)
         zc_tri = tris[:, :, 2].mean(axis=1)
-        st = (nz > 0.8) & (zc_tri >= 0.15) & (zc_tri <= 0.60)
+        st = (nz > 0.8) & (zc_tri >= 0.15) & (zc_tri <= 0.68)
         for ti in np.nonzero(st)[0]:
             t = tris[ti]
             i0 = max(0, int((t[:, 0].min() - xy_min[0]) / cell))
@@ -297,7 +297,7 @@ def _tri_dist2d(t, px, py):
 
 def merge_zones(occ, top, xy_min, cell):
     """행 단위 런 병합(같은 높이 계급) → 세로 방향 동일 런 병합."""
-    tall = top >= 0.5
+    tall = top >= 0.68   # 침대(~0.6m)는 낮은 가구 — 0.5는 침대를 벽 취급했음
     runs = {}          # (j0, i0, i1, is_tall) 후보 → 세로 병합
     boxes = []
     nx, ny = occ.shape
@@ -559,8 +559,16 @@ def main():
     allv = np.concatenate([np.asarray(g.vertices) for _, g in parts])
     bbox = [allv[:, 0].min(), allv[:, 1].min(),
             allv[:, 0].max(), allv[:, 1].max()]
+    # 셀 단위 높이 지도 — 병합 구역은 벽·침대가 한 박스로 합쳐져
+    # 최고 높이가 오염됨(눕기 상대 높이 판정 불가). cm 단위 정수.
+    top_grid = {'xy_min': [round(float(xy_min[0]), 3),
+                           round(float(xy_min[1]), 3)],
+                'cell': cell,
+                'rows': [[int(round(v * 100)) for v in row]
+                         for row in top.tolist()]}
     meta = {'parts': meta_parts, 'zones': zones, 'seats': seats,
             'plugs': plugs, 'spawn': spawn, 'free': free, 'cell': cell,
+            'top_grid': top_grid,
             'bbox': [round(float(b), 3) for b in bbox]}
     with open(os.path.join(outdir, 'meta.json'), 'w') as fp:
         json.dump(meta, fp)

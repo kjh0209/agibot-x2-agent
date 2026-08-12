@@ -531,6 +531,12 @@ class X2SimNode(Node):
             # 실행)의 표면 정보라 정답 기하 사용이 정당 — 게이팅과
             # 동일 원칙.
             self._scan_seats = smeta.get('seats', [])
+            # 셀 단위 높이 지도 — 눕기 상대 높이 판정용 (병합 구역은
+            # 벽·침대가 합쳐져 최고 높이가 오염됨)
+            tg = smeta.get('top_grid')
+            self._scan_topgrid = (
+                (np.array(tg['rows'], dtype=float) / 100.0,
+                 tg['xy_min'], tg['cell']) if tg else None)
             # ★경계 봉쇄 — 실제 스캔엔 구멍(미촬영 창/개구부)이 있어
             # 로봇이 스캔 밖 허공으로 걸어나가는 사고 실측 (탐색이
             # 허공에서 '사무실'을 학습). bbox 4변을 키 큰 구역으로
@@ -552,6 +558,7 @@ class X2SimNode(Node):
                 self._scan_zones.append([pcx, pcy, phx, phy, 2.2])
         else:
             self._scan_seats = []
+            self._scan_topgrid = None
 
         # 집기 시스템: 손(오른 손목 끝 링크) + 물체별 freejoint 주소
         self.hand_bid = mujoco.mj_name2id(
@@ -845,6 +852,24 @@ class X2SimNode(Node):
         'left_ankle_pitch_joint': -0.15, 'right_ankle_pitch_joint': -0.15,
     }
 
+    def _top_at(self, x, y):
+        """(x,y)의 점유 최고 높이 (여유 미적용). 없으면 0.
+
+        스캔 월드는 셀 단위 높이 지도 사용 — 병합 구역의 오염 없음."""
+        g = getattr(self, '_scan_topgrid', None)
+        if g is not None:
+            arr, (x0, y0), cell = g
+            i = int((x - x0) / cell)
+            j = int((y - y0) / cell)
+            if 0 <= i < arr.shape[0] and 0 <= j < arr.shape[1]:
+                return float(arr[i, j])
+            return 0.0
+        best = 0.0
+        for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
+            if abs(x - cx) <= hx and abs(y - cy) <= hy:
+                best = max(best, top)
+        return best
+
     def _platform_top(self, x, y):
         """(x,y) 아래의 앉을 수 있는 면 높이. 없으면 0.
 
@@ -855,7 +880,7 @@ class X2SimNode(Node):
             if abs(x - cx) <= hx + 0.05 and abs(y - cy) <= hy + 0.05:
                 best = max(best, h)
         for (cx, cy, hx, hy, margin, top, name) in self.block_zones:
-            if top < 0.6 and abs(x - cx) <= hx + 0.05 \
+            if top < 0.68 and abs(x - cx) <= hx + 0.05 \
                     and abs(y - cy) <= hy + 0.05:
                 best = max(best, top)
         return best
@@ -930,37 +955,94 @@ class X2SimNode(Node):
             if found is None:
                 found = self._find_platform(
                     -1, (0.25, 0.4, 0.55, 0.7, 0.85))
+            # 스캔 월드 폴백: 원뿔 프로브(고정 거리 샘플)가 얇은
+            # 가장자리 좌석 스트립을 수 cm 차이로 빗나가는 실측 보완 —
+            # 1.2m 내 가장 가까운 좌석면으로 직접 진입
+            if found is None and getattr(self, '_scan_seats', None):
+                bx, by = self.base_xyz[0], self.base_xyz[1]
+                near_seat = None
+                for (scx, scy, shx, shy, sh) in self._scan_seats:
+                    sd = math.hypot(scx - bx, scy - by)
+                    if sd < 1.2 and sh >= 0.25 and (
+                            near_seat is None or sd < near_seat[0]):
+                        near_seat = (sd, scx, scy, sh)
+                if near_seat is not None:
+                    found = (near_seat[1] - bx, near_seat[2] - by,
+                             near_seat[3])
             # ★표면 깊이 검증 — 진입점 0.45m 안쪽에도 표면이 있어야
             # 몸을 실을 수 있는 가구다. 폭 15cm 창턱을 '침대'로 알고
             # 올라가 벽에 머리를 박고 눕던 실측 사고 방지.
             if found:
                 gx, gy, top = found
                 n = math.hypot(gx, gy) or 1.0
-                deep = self._platform_top(
-                    self.base_xyz[0] + gx + gx / n * 0.45,
-                    self.base_xyz[1] + gy + gy / n * 0.45)
-                if deep <= 0.05:
+                dpx = self.base_xyz[0] + gx + gx / n * 0.45
+                dpy = self.base_xyz[1] + gy + gy / n * 0.45
+                deep_seat = self._platform_top(dpx, dpy)
+                deep_all = self._top_at(dpx, dpy)
+                # 이어지는 표면 인정: 좌석면 지도 또는 점유 높이가
+                # 진입면과 같은 대역(이불·베개 요철 ≤0.5m 허용)
+                if not (deep_seat > 0.05
+                        or (top - 0.25 <= deep_all <= top + 0.5)):
                     found = None
             if found:
                 gx, gy, top = found     # 감지 지점보다 0.30m 안쪽까지
                 n = math.hypot(gx, gy) or 1.0
                 glide = (gx * (1 + 0.30 / n), gy * (1 + 0.30 / n))
                 self._pose_surface = top
+                # ★장축 정렬 눕기 — 벽에 붙은 침대(현실 대부분)는 진입
+                # 방향(가로)으로 누우면 머리가 벽을 뚫는다. 사람처럼
+                # 표면의 긴 축을 따라 눕는다.
+                # 판정은 ★상대 높이: 실측 스캔 침대는 이불 주름·베개로
+                # 셀 최고 높이가 0.7~1.0m까지 들쭉이라 절대 임계값
+                # (키 큰/낮은)으로는 침대 전체가 벽 취급됨. '표면 위로
+                # 0.45m 넘게 솟은 것(벽/헤드보드)만 장애물, 이불·베개
+                # 수준(≤0.45m)은 누울 수 있음'이 물리적으로 옳은 규칙.
+                Gx = self.base_xyz[0] + glide[0]
+                Gy = self.base_xyz[1] + glide[1]
+                surface = top
+
+                def _lieable(x, y):
+                    t_seat = self._platform_top(x, y)
+                    t_all = self._top_at(x, y)
+                    if t_seat >= surface - 0.25:      # 표면 이어짐
+                        return t_all - max(t_seat, surface) <= 0.5
+                    # 좌석면 지도가 빈 곳(이불 주름)도 점유 높이가
+                    # 표면대(±0.45)면 눕는 면으로 인정
+                    return (t_all >= surface - 0.25
+                            and t_all - surface <= 0.45)
+
+                def _ext(ux, uy):
+                    d = 0.0
+                    while d < 1.2 and _lieable(Gx + ux * (d + 0.15),
+                                               Gy + uy * (d + 0.15)):
+                        d += 0.15
+                    return d
+
+                best = None
+                for ux, uy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    e = _ext(ux, uy)
+                    if e < 0.75:          # 머리(+0.75m)까지 표면·공간 확보
+                        continue
+                    if best is None or e > best[0]:
+                        best = (e, ux, uy)
+                if best is None:
+                    self.get_logger().info(
+                        '눕기 거부: 표면 위 어느 방향에도 머리 공간 '
+                        '없음 (표면 협소/벽 밀착)')
+                    return
+                _, ux, uy = best
+                want_yaw = math.atan2(uy, ux)
+                dyaw = (want_yaw - yaw + math.pi) % (2 * math.pi) \
+                    - math.pi
             else:
                 glide, top = (0.45 * c, 0.45 * s), 0.0
-            # ★머리 공간 검증 — 누우면 머리가 베이스에서 글라이드
-            # 방향으로 ~0.75m 더 뻗는다. 그 지점이 벽/키 큰 구조물이면
-            # 눕기 자체를 거부 (실기였다면 벽지/로봇 머리가 파손될
-            # 상황 — 사용자 지적). 자세는 그대로, 에이전트가 posture
-            # 미변경을 보고 정직하게 실패 보고.
-            gn = math.hypot(glide[0], glide[1]) or 1.0
-            head_x = self.base_xyz[0] + glide[0] + glide[0] / gn * 0.75
-            head_y = self.base_xyz[1] + glide[1] + glide[1] / gn * 0.75
-            if self._tall_pen(head_x, head_y) > 0.0:
-                self.get_logger().info(
-                    '눕기 거부: 머리가 뻗을 방향에 벽/키 큰 구조물 — '
-                    '공간 부족')
-                return
+                # 바닥 눕기: 머리가 뻗을 전방 지점의 벽 검사
+                head_x = self.base_xyz[0] + glide[0] + c * 0.75
+                head_y = self.base_xyz[1] + glide[1] + s * 0.75
+                if self._tall_pen(head_x, head_y) > 0.0:
+                    self.get_logger().info(
+                        '눕기 거부: 머리가 뻗을 방향에 벽/키 큰 구조물')
+                    return
             # +0.22: 몸이 매트리스에 파묻히면 접촉 지터로 천장 시야가
             # 계속 흔들림 (사용자 제보) — 접촉을 최소화하는 높이.
             # 피치 -1.72(-98°): 카메라 자체가 18° 하향 장착이라 -80°로는
@@ -1277,7 +1359,7 @@ class X2SimNode(Node):
                 hx = hy = float(s[0])
                 top = float(p[2]) + float(s[1] if gtype == int(
                     mujoco.mjtGeom.mjGEOM_CYLINDER) else s[0])
-            margin = 0.30 if top >= 0.5 else 0.12
+            margin = 0.30 if top >= 0.68 else 0.12
             self.block_zones.append(
                 (float(p[0]), float(p[1]), hx, hy, margin, top, name))
         # 스캔 월드 점유 구역 — 격자 셀이 이미 표면 범위를 덮으므로
@@ -1286,7 +1368,7 @@ class X2SimNode(Node):
         # (셀 자체가 표면을 반셀 이상 덮어 실효 이격은 더 큼)
         for k, (cx, cy, hx, hy, top) in enumerate(
                 getattr(self, '_scan_zones', []) or []):
-            margin = 0.15 if top >= 0.5 else 0.10
+            margin = 0.15 if top >= 0.68 else 0.10
             self.block_zones.append(
                 (cx, cy, hx, hy, margin, top, f'scan_{k}'))
         # 게이팅 벡터화 배열 — 스캔 월드는 구역이 수십~수백 개라
@@ -1295,7 +1377,9 @@ class X2SimNode(Node):
             if self.block_zones else np.zeros((0, 6))
         self._zone_arr = za
         self._zone_arr_names = [z[6] for z in self.block_zones]
-        self._zone_tall_mask = (za[:, 5] >= 0.5) if len(za) else \
+        # 0.68: 침대(~0.6m)는 '키 큰 구조물' 아님 — 0.5는 침대를
+        # 벽 취급해 침대 눕기가 전방향 거부되던 실측 결함
+        self._zone_tall_mask = (za[:, 5] >= 0.68) if len(za) else \
             np.zeros(0, dtype=bool)
         # 코스트맵 발행 정책:
         # - 지도가 있는 공간(home 등 비탐색 월드) = '이전에 SLAM으로

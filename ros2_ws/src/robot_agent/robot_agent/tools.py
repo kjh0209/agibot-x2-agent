@@ -43,6 +43,15 @@ MIN_BATTERY_PCT = 15   # 이 미만이면 이동/모션 거절 (충전 안내)
 
 AUDIT_PATH = os.environ.get('AGENT_AUDIT_LOG', '/ws/log/tool_audit.jsonl')
 
+# 지각(VLM) 모델 이원화 — 월드/현실 불문 일반화의 핵심 레버:
+# - VLM_MODEL: 대량 호출되는 탐색 스캔(재현율 지향, 오답은 검증
+#   관문이 걸러줌) — 빠르고 싼 모델
+# - VLM_VERIFY_MODEL: 지도의 사실을 최종 확정하는 판정 관문
+#   (현장 검증·방 분류 — 정밀도 지향) — 상위 모델
+# 환경변수로 교체 가능 (재시작만으로 지각 성능 업그레이드).
+VLM_MODEL = os.environ.get('VLM_MODEL', 'claude-haiku-4-5')
+VLM_VERIFY_MODEL = os.environ.get('VLM_VERIFY_MODEL', 'claude-sonnet-5')
+
 # sim/real 전환 (로드맵 원칙: 설정만으로 전환)
 #   sim  — speak/emoji를 UI 토픽으로 (시뮬에는 스피커/표정화면 없음)
 #   real — 실기 PlayTts/PlayEmoji 서비스 호출
@@ -735,7 +744,7 @@ class ToolExecutor:
             if not hasattr(self, '_vlm'):
                 self._vlm = anthropic.Anthropic()
             r = self._vlm.messages.create(
-                model='claude-haiku-4-5', max_tokens=250,
+                model=VLM_MODEL, max_tokens=250,
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {
                         'type': 'base64', 'media_type': 'image/jpeg',
@@ -889,7 +898,7 @@ class ToolExecutor:
                     'data': base64.standard_b64encode(f).decode()}})
             content.append({'type': 'text', 'text': self.VLM_ROOM_PROMPT})
             r = self._vlm.messages.create(
-                model='claude-haiku-4-5', max_tokens=150,
+                model=VLM_VERIFY_MODEL, max_tokens=150,
                 messages=[{'role': 'user', 'content': content}])
             txt = ''.join(b.text for b in r.content if b.type == 'text')
             txt = txt[txt.find('{'):txt.rfind('}') + 1]
@@ -931,7 +940,7 @@ class ToolExecutor:
             if not hasattr(self, '_vlm'):
                 self._vlm = anthropic.Anthropic()
             r = self._vlm.messages.create(
-                model='claude-haiku-4-5', max_tokens=120,
+                model=VLM_VERIFY_MODEL, max_tokens=120,
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {
                         'type': 'base64', 'media_type': 'image/jpeg',
@@ -961,7 +970,7 @@ class ToolExecutor:
 
     def _has_seat_evidence(self, x, y, radius=1.3):
         for z in getattr(self.node, 'costmap', []):
-            if len(z) < 7 or not (0.15 <= z[6] <= 0.55):
+            if len(z) < 7 or not (0.15 <= z[6] <= 0.68):
                 continue
             nx = max(z[0] - z[2], min(x, z[0] + z[2]))
             ny = max(z[1] - z[3], min(y, z[1] + z[3]))
@@ -999,7 +1008,7 @@ class ToolExecutor:
                     'data': base64.standard_b64encode(f).decode()}})
             content.append({'type': 'text', 'text': self.VLM_SCAN4_PROMPT})
             r = self._vlm.messages.create(
-                model='claude-haiku-4-5', max_tokens=500,
+                model=VLM_MODEL, max_tokens=500,
                 messages=[{'role': 'user', 'content': content}])
             txt = ''.join(b.text for b in r.content if b.type == 'text')
             txt = txt[txt.find('['):txt.rfind(']') + 1]
@@ -1383,7 +1392,7 @@ class ToolExecutor:
             return
         best = None
         for z in getattr(self.node, 'costmap', []):
-            if len(z) < 7 or not (0.15 <= z[6] <= 0.55):
+            if len(z) < 7 or not (0.15 <= z[6] <= 0.68):
                 continue
             nx = max(z[0] - z[2], min(pos[0], z[0] + z[2]))
             ny = max(z[1] - z[3], min(pos[1], z[1] + z[3]))
