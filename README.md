@@ -1,40 +1,90 @@
-# Agibot X2 메신저 에이전트 시스템
+# AgiBot X2 Home Agent
 
-로봇(Agibot X2 Ultra)의 시점 영상과 상태를 맥락으로 갖고, 자체 채팅 앱에서
-사람과 직접 대화하며 툴 콜로 행동하는 에이전트 시스템.
-시뮬레이션(MuJoCo)에서 완성한 코드를 설정 전환만으로 실기에 연결하는 것이 목표.
+A language-driven agent for the AgiBot X2 Ultra humanoid that walks into a home it has never seen, builds its own map, learns what each room and object is, and carries out chat commands such as "go to the bed" or "pick up the ball and put it on the sofa".
 
-- 전체 계획: [`agibot_x2_메신저_시스템_로드맵.md`](./agibot_x2_메신저_시스템_로드맵.md)
-- 비용 계획: [`agibot_x2_단계별_비용_정리.txt`](./agibot_x2_단계별_비용_정리.txt)
-- SDK 문서: https://x2-aimdk.agibot.com
+Everything runs in a self-built MuJoCo simulator that publishes the robot's official ROS 2 topics and enforces its real control protocol, so the agent code is written against the same interfaces it would use on hardware.
 
-## 저장소 구조 (예정)
+Built by Jihyeok Kim (KAIST) in August 2026 as an independent project. Simulation only: no physical robot was used.
 
-```
-ros2_ws/src/
-  x2_sim/         # 자체 MuJoCo 시뮬 (공식 MJCF·토픽·메시지, 카메라, MC 목,
-                  #   충돌 차단, PMU 목, 리셋 서비스) + MJPEG 뷰어(:8080)
-  robot_agent/    # Claude 두뇌 (툴 실행기·안전 가드·감사 로그) + chat_cli
-chat/             # 자체 채팅 앱 — FastAPI+WS 백엔드 / 무빌드 프론트 (:8000)
-scripts/          # env_x2.sh(환경), setup_sim.sh(x86용), chaos_mc.sh(카오스)
-deploy/           # Phase 8: systemd 유닛, requirements.lock
-docs/             # 실기 준비 체크리스트/네트워크/견적 초안/데모 각본
-docker/           # Ubuntu 22.04 + ROS 2 Humble 개발 컨테이너 (arm64)
-sdk/              # AimDK SDK/URDF (downloads/·해제본은 git 제외)
-```
+## Why
 
-## 개발 환경
+Household robots will enter homes that nobody has mapped for them. On the first day, the robot has to learn the layout and the meaning of each place within minutes, keep that knowledge correct, and let a person talk to it naturally. I built the whole loop to find out which part of this is actually hard.
 
-개발 머신이 Apple Silicon Mac이므로 ROS 2 Humble은 Docker 컨테이너
-(Ubuntu 22.04 arm64)에서 구동한다. `docker/README.md` 참고.
-
-주의: 실기(X2 Ultra) 연결 단계에서는 네이티브 Ubuntu 22.04 PC 권장
-(DDS 멀티캐스트/카메라 대역폭 이슈 회피).
-
-## 비밀키
-
-`.env` 파일에 보관하며 git에 커밋하지 않는다 (`.gitignore` 처리됨).
+## How it works
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
+ MuJoCo world (hand-built houses, photogrammetry scans of real rooms)
+        │  official X2 topics, motion-control protocol, head camera
+        ▼
+ Geometry layer      simulated LiDAR (4 heights x 96 bearings, 5 Hz)
+                     -> log-odds occupancy grid with per-cell height (slam_map.py)
+        ▼
+ Semantic layer      frontier exploration; 4-frame scans -> VLM labels
+                     {room, furniture, objects}; fast model proposes,
+                     stronger model confirms on site before anything enters the map
+        ▼
+ Language layer      tool-calling LLM sees compact state (places, rooms, objects, pose),
+                     not raw frames, and acts through tools
+        ▼
+ Chat app            FastAPI + WebSocket backend, browser frontend with voice output
 ```
+
+Tools available to the LLM: `explore`, `survey_map`, `remember_place`, `forget_map`, `go_to_place`, `go_to_object`, `go_to_point`, `move`, `turn`, `turn_head`, `face`, `look`, `pick_up`, `put_down`, `open_door`, `close_door`, `sit_down`, `lie_down`, `stand_up`, `stop`, `speak`, `play_motion`, `show_emoji`, `get_status`.
+
+Safety: a geometric motion gate (base footprint vs. obstacles with clearance), a reflex layer that stops before collisions, a hard-wired stop path that bypasses the LLM, and an audit log of every tool call.
+
+## Results (simulation)
+
+| Measure | Value | Note |
+|---|---|---|
+| Occupancy map accuracy | 91.3% | mapped cells within 0.15 m of true geometry |
+| Full house from a blank map | 14.4 min | 13 places, each verified on site; audit found 0 places inside furniture |
+| Fetch (find, pick up, carry) | 156 s -> 42 s | after cost-map A* with clearance preference |
+| "Look at X" | minutes -> 15 s | direct `face` tool instead of visual search |
+| Errand smoke test | 9 / 9 | `scripts/smoke_test.sh`, run after every change |
+
+## What failed and what it taught me
+
+- **Geometry was easy; meaning was the bottleneck.** A room was labeled "bedroom" because four frames from one spot counted as four votes. The fix: one vote per scan, two independent votes from positions 0.8 to 3.5 m apart, and a re-check of every room with an evidence prompt ("bedroom only if a bed is visible").
+- **Fixed thresholds do not transfer between homes.** On a scanned real bed, blanket folds reached 0.7 to 1.0 m, so every fixed "tall obstacle" height failed. A relative rule (more than 0.45 m above the surface is a wall or headboard) worked in every world.
+- **A ground-truth map hides failures.** After removing the simulator's privileged map, A* wandered into unobserved space and the robot's own cell was marked occupied. Neither showed up before.
+- **Exploration is slow.** One round covers about 1 to 1.5 rooms; a full house needs repeated rounds.
+
+Limits: the VLM and LLM are cloud models (Claude Haiku / Sonnet through the API), not on the robot; low-resolution renders (320x240) still cause naming errors.
+
+## Repository layout
+
+```
+ros2_ws/src/x2_sim/        MuJoCo simulator node: worlds, head camera, LiDAR, motion-control mock, MJPEG viewer
+ros2_ws/src/robot_agent/   LLM agent: tools, occupancy mapping, VLM labeling, safety, audit log, chat CLI
+ros2_ws/tools/             photogrammetry scan (GLB) -> MuJoCo world converter
+ros2_ws/assets/tex/        CC0 textures
+chat/                      chat app (FastAPI + WebSocket backend, static frontend)
+docker/                    Ubuntu 22.04 + ROS 2 Humble dev container
+scripts/                   environment, setup, supervisor, smoke test, chaos test
+deploy/                    systemd units for running on the robot's host PC
+docs/                      hardware-transition checklist, network setup, demo script (Korean)
+```
+
+The design log (`진행상황_정리.txt`) and the roadmap are in Korean and record every decision and bug in order.
+
+## Running it
+
+Requirements: Docker (Colima on Apple Silicon), an Anthropic API key.
+
+```bash
+cp .env.example .env            # set ANTHROPIC_API_KEY
+cd docker && docker compose build && docker compose up -d
+docker exec -it agibot-dev bash
+
+# inside the container
+cd /ws && colcon build && source install/setup.bash
+bash /scripts/supervise_sim.sh &          # simulator (auto-restarts on crash)
+ros2 run x2_sim mjpeg_server &            # live camera viewer
+ros2 run robot_agent agent_node &         # LLM agent
+python3 /chat/backend/main.py             # chat app on http://localhost:8000
+```
+
+Optional environment variables: `AGENT_MODEL` (default `claude-haiku-4-5`), `VLM_MODEL`, `VLM_VERIFY_MODEL`.
+
+The AgiBot SDK and URDF are not redistributed here; download them from the official developer site (https://x2-aimdk.agibot.com) into `sdk/downloads/`. The photogrammetry scan worlds need your own GLB scans, converted with `ros2_ws/tools/convert_scan.py`.
